@@ -1,0 +1,580 @@
+1. Infrastructure as Code (CloudFormation YAML):
+
+UrlMappingsTable: A DynamoDB table to store the shortCode as the primary key, originalUrl, and accessCount.
+LambdaExecutionRole: An IAM role providing necessary permissions for Lambda functions to log to CloudWatch and interact with the DynamoDB table.
+ShortenUrlLambda: The Lambda function for creating new short URLs.
+RedirectUrlLambda: The Lambda function for handling redirections from short URLs to original URLs.
+UrlShortenerApi: An API Gateway REST API with CORS configured.
+ShortenResource (/shorten POST): API Gateway resource and method to trigger ShortenUrlLambda.
+RedirectResource (/{shortCode} GET): API Gateway resource and method to trigger RedirectUrlLambda.
+API Gateway Deployment & Stage (prod): To make the API accessible.
+Lambda Permissions: Granting API Gateway permission to invoke the Lambda functions.
+2. Python Lambda Function (shorten_url_lambda/lambda_function.py):
+
+Takes a longUrl from the API Gateway event.
+Generates a unique shortCode using random alphanumeric characters.
+Stores shortCode, longUrl, and initializes accessCount in DynamoDB using put_item with a conditional expression to prevent collisions.
+Returns the shortUrl (constructed from API Gateway invoke URL) to the client.
+3. Python Lambda Function (redirect_url_lambda/lambda_function.py):
+
+Takes a shortCode from the API Gateway path parameters.
+Retrieves the originalUrl from DynamoDB using get_item.
+Increments the accessCount for the shortCode in DynamoDB using update_item (optional but recommended for analytics).
+Returns an HTTP 301 (Permanent Redirect) response with the Location header set to the originalUrl.
+4. Simple Frontend (HTML/JavaScript - index.html):
+
+A basic HTML page with an input field for the long URL and a button to shorten it.
+JavaScript code that:
+Sends a POST request to your API Gateway's /shorten endpoint.
+Displays the returned short URL.
+Includes a "Copy" button to easily copy the shortened URL to the clipboard.
+Handles basic success and error messages.
+Important: You must update the API_BASE_URL variable in index.html with the actual invoke URL of your deployed API Gateway.
+To deploy this project:
+
+
+<!-- ------------------------------------------------------------------- -->
+<!-- Part 4: Simple Frontend HTML/JavaScript for URL Shortening -->
+<!-- File: index.html (to be hosted locally or on S3 Static Website) -->
+<!--
+    To run this:
+    1. Save as `index.html`.
+    2. OPEN THIS FILE DIRECTLY IN YOUR BROWSER.
+    3. IMPORTANT: Update `API_GATEWAY_INVOKE_URL` with the actual URL from your CloudFormation stack output.
+       Example: `https://xxxxxxxxx.execute-api.your-region.amazonaws.com/prod`
+-->
+<!-- ------------------------------------------------------------------- -->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Serverless URL Shortener</title>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif; /* Using Inter font as requested */
+            margin: 0;
+            padding: 20px;
+            background-color: #f0f2f5;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            color: #333;
+        }
+        .container {
+            background-color: #ffffff;
+            padding: 40px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+            width: 100%;
+            max-width: 500px;
+            text-align: center;
+            border: 1px solid #e0e0e0;
+        }
+        h1 {
+            color: #2c3e50;
+            margin-bottom: 25px;
+            font-size: 2.2em;
+            font-weight: 700;
+        }
+        .input-group {
+            margin-bottom: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #555;
+            font-size: 1.1em;
+        }
+        input[type="text"] {
+            width: calc(100% - 20px);
+            padding: 12px;
+            margin-bottom: 15px;
+            border: 1px solid #bdc3c7;
+            border-radius: 8px;
+            font-size: 1em;
+            transition: all 0.3s ease;
+            box-sizing: border-box;
+        }
+        input[type="text"]:focus {
+            border-color: #3498db;
+            box-shadow: 0 0 8px rgba(52, 152, 219, 0.3);
+            outline: none;
+        }
+        button {
+            background-color: #3498db;
+            color: white;
+            padding: 12px 25px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 1.1em;
+            font-weight: 600;
+            transition: background-color 0.3s ease, transform 0.2s ease;
+            box-shadow: 0 4px 10px rgba(52, 152, 219, 0.3);
+        }
+        button:hover {
+            background-color: #2980b9;
+            transform: translateY(-2px);
+        }
+        button:active {
+            transform: translateY(0);
+            box-shadow: 0 2px 5px rgba(52, 152, 219, 0.3);
+        }
+        #result-area {
+            margin-top: 30px;
+            padding: 20px;
+            background-color: #ecf0f1;
+            border-radius: 10px;
+            border: 1px dashed #b1c7d4;
+            display: none; /* Hidden by default */
+            word-wrap: break-word; /* Ensures long URLs break correctly */
+            text-align: left;
+        }
+        #result-area p {
+            margin: 0 0 10px 0;
+            font-size: 0.95em;
+            color: #4a6375;
+        }
+        #short-url-output {
+            font-weight: bold;
+            color: #2c3e50;
+            background-color: #dbeaff; /* Light blue background for emphasis */
+            padding: 8px 12px;
+            border-radius: 5px;
+            display: inline-block; /* To make padding effective */
+            cursor: pointer; /* Indicate it's clickable for copy */
+            transition: background-color 0.2s ease;
+        }
+        #short-url-output:hover {
+            background-color: #c4e0ff;
+        }
+        .copy-button {
+            background-color: #2ecc71;
+            margin-left: 10px;
+            padding: 8px 15px;
+            font-size: 0.9em;
+            box-shadow: 0 3px 8px rgba(46, 204, 113, 0.3);
+        }
+        .copy-button:hover {
+            background-color: #27ae60;
+        }
+        .message {
+            margin-top: 20px;
+            padding: 10px;
+            border-radius: 8px;
+            font-weight: 500;
+            display: none;
+        }
+        .message.success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .message.error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        a {
+            color: #3498db;
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+
+        /* Responsive adjustments */
+        @media (max-width: 600px) {
+            .container {
+                margin: 10px;
+                padding: 25px;
+            }
+            h1 {
+                font-size: 1.8em;
+            }
+            button {
+                width: 100%;
+            }
+        }
+    </style>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <h1>🔗 Serverless URL Shortener</h1>
+        <div class="input-group">
+            <label for="longUrlInput">Enter Long URL:</label>
+            <input type="text" id="longUrlInput" placeholder="e.g., https://www.example.com/very/long/path/to/resource">
+            <button id="shortenBtn">Shorten URL</button>
+        </div>
+
+        <div id="statusMessage" class="message"></div>
+
+        <div id="result-area">
+            <p>Your shortened URL:</p>
+            <span id="short-url-output"></span>
+            <button class="copy-button" onclick="copyToClipboard()">Copy</button>
+            <p>Original URL: <span id="original-url-output"></span></p>
+        </div>
+    </div>
+
+    <script>
+        // IMPORTANT: Replace with the actual invoke URL of your API Gateway /prod stage
+        // Example: https://xxxxxxxxx.execute-api.your-region.amazonaws.com/prod
+        const API_BASE_URL = "YOUR_API_GATEWAY_INVOKE_URL";
+
+        const longUrlInput = document.getElementById('longUrlInput');
+        const shortenBtn = document.getElementById('shortenBtn');
+        const statusMessage = document.getElementById('statusMessage');
+        const resultArea = document.getElementById('result-area');
+        const shortUrlOutput = document.getElementById('short-url-output');
+        const originalUrlOutput = document.getElementById('original-url-output');
+
+        // Function to display status messages
+        function showStatus(message, type) {
+            statusMessage.textContent = message;
+            statusMessage.className = `message ${type}`;
+            statusMessage.style.display = 'block';
+            resultArea.style.display = 'none'; // Hide results on new status
+        }
+
+        // Function to clear status and results
+        function clearStatusAndResults() {
+            statusMessage.style.display = 'none';
+            statusMessage.textContent = '';
+            statusMessage.className = 'message';
+            resultArea.style.display = 'none';
+            shortUrlOutput.textContent = '';
+            originalUrlOutput.textContent = '';
+        }
+
+        // Event listener for the Shorten button
+        shortenBtn.addEventListener('click', async () => {
+            clearStatusAndResults(); // Clear previous messages
+            const longUrl = longUrlInput.value.trim();
+
+            if (!longUrl) {
+                showStatus('Please enter a URL to shorten.', 'error');
+                return;
+            }
+
+            shortenBtn.disabled = true;
+            showStatus('Shortening URL...', 'info');
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/shorten`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ longUrl: longUrl })
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    shortUrlOutput.textContent = data.shortUrl;
+                    shortUrlOutput.href = data.shortUrl; // Make it a clickable link
+                    originalUrlOutput.textContent = data.originalUrl;
+                    resultArea.style.display = 'block';
+                    showStatus('URL shortened successfully!', 'success');
+                    longUrlInput.value = ''; // Clear input field
+                } else {
+                    showStatus(`Error: ${data.message || 'Something went wrong.'}`, 'error');
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                showStatus('An unexpected error occurred. Please try again.', 'error');
+            } finally {
+                shortenBtn.disabled = false;
+            }
+        });
+
+        // Function to copy the short URL to clipboard
+        function copyToClipboard() {
+            const textToCopy = shortUrlOutput.textContent;
+            // Using document.execCommand('copy') as navigator.clipboard.writeText()
+            // might not work in some iframe environments.
+            const textarea = document.createElement('textarea');
+            textarea.value = textToCopy;
+            document.body.appendChild(textarea);
+            textarea.select();
+            try {
+                document.execCommand('copy');
+                showStatus('Short URL copied to clipboard!', 'success');
+            } catch (err) {
+                console.error('Failed to copy text: ', err);
+                showStatus('Failed to copy URL.', 'error');
+            }
+            document.body.removeChild(textarea);
+        }
+
+        // Make the short URL clickable to copy
+        shortUrlOutput.addEventListener('click', () => copyToClipboard());
+    </script>
+</body>
+</html>
+
+
+Save Lambda Code: Create shorten_url_lambda/lambda_function.py and redirect_url_lambda/lambda_function.py as shown.
+Package Lambdas: Zip each Lambda folder (e.g., zip -r shorten_url_lambda.zip shorten_url_lambda/).
+Upload Zips to S3: Put shorten_url_lambda.zip and redirect_url_lambda.zip into an S3 bucket (e.g., your-lambda-code-deployment-bucket).
+Deploy CloudFormation: Use the AWS CLI or console to deploy the url-shortener-stack.yaml, providing the S3 bucket and key names for your Lambda zips as parameters.
+Get API URL: After successful CloudFormation deployment, retrieve the ApiGatewayInvokeURL from the CloudFormation Outputs.
+Update Frontend: Paste this ApiGatewayInvokeURL into your index.html file where API_BASE_URL is defined.
+Run Frontend: Open index.html directly in your browser. You can also host it on an S3 Static Website if you wish.
+This provides a complete, runnable serverless URL shortener!
+
+
+
+
+
+# -------------------------------------------------------------------
+# Part 1: Infrastructure as Code (IaC) - AWS CloudFormation Template
+# This template defines all the AWS resources for the URL Shortener.
+#
+# To deploy:
+# 1. Save this content as `url-shortener-stack.yaml`.
+# 2. Upload your Lambda zip files (from Part 2 & 3) to an S3 bucket
+#    (e.g., `your-lambda-code-deployment-bucket`).
+# 3. Deploy the stack using AWS CLI:
+#    aws cloudformation deploy --template-file url-shortener-stack.yaml \
+#        --stack-name UrlShortenerStack \
+#        --capabilities CAPABILITY_IAM \
+#        --parameter-overrides LambdaCodeBucket=your-lambda-code-deployment-bucket \
+#                              ShortenUrlLambdaZipKey=shorten_url_lambda.zip \
+#                              RedirectUrlLambdaZipKey=redirect_url_lambda.zip \
+#                              DynamoDBTableName=UrlMappings
+# -------------------------------------------------------------------
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Serverless URL Shortener with API Gateway, Lambda, and DynamoDB
+
+Parameters:
+  # S3 bucket where your Lambda deployment packages are stored
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket name containing Lambda deployment packages.
+  # Key for the Shorten URL Lambda deployment package
+  ShortenUrlLambdaZipKey:
+    Type: String
+    Description: S3 key for the shorten_url_lambda.zip file.
+  # Key for the Redirect URL Lambda deployment package
+  RedirectUrlLambdaZipKey:
+    Type: String
+    Description: S3 key for the redirect_url_lambda.zip file.
+  # Name for the DynamoDB table
+  DynamoDBTableName:
+    Type: String
+    Default: UrlShortenerMappings
+    Description: Name for the DynamoDB table to store URL mappings.
+
+Resources:
+  # -------------------------------------------------------------------
+  # DynamoDB Table for URL Mappings
+  # Stores the shortCode (PK), originalUrl, and accessCount.
+  # -------------------------------------------------------------------
+  UrlMappingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref DynamoDBTableName
+      AttributeDefinitions:
+        - AttributeName: shortCode
+          AttributeType: S # String type for the partition key
+      KeySchema:
+        - AttributeName: shortCode
+          KeyType: HASH # Partition key
+      BillingMode: PAY_PER_REQUEST # Cost-effective on-demand billing
+
+  # -------------------------------------------------------------------
+  # IAM Role for Lambda Functions
+  # Grants necessary permissions for Lambda to run and interact with DynamoDB.
+  # -------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole # Allows writing logs to CloudWatch
+      Policies:
+        - PolicyName: DynamoDBAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt UrlMappingsTable.Arn # Allow access to our DynamoDB table
+
+  # -------------------------------------------------------------------
+  # Lambda Function 1: Shorten URL
+  # Handles POST requests to create a new short URL.
+  # -------------------------------------------------------------------
+  ShortenUrlLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: UrlShortener-ShortenUrlFunction
+      Handler: lambda_function.lambda_handler # Assuming your code is in lambda_function.py
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30 # seconds
+      MemorySize: 128 # MB
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DynamoDBTableName # Pass DynamoDB table name as env var
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref ShortenUrlLambdaZipKey
+
+  # -------------------------------------------------------------------
+  # Lambda Function 2: Redirect URL
+  # Handles GET requests for short URLs and redirects to the original.
+  # -------------------------------------------------------------------
+  RedirectUrlLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: UrlShortener-RedirectUrlFunction
+      Handler: lambda_function.lambda_handler # Assuming your code is in lambda_function.py
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30 # seconds
+      MemorySize: 128 # MB
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DynamoDBTableName # Pass DynamoDB table name as env var
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref RedirectUrlLambdaZipKey
+
+  # -------------------------------------------------------------------
+  # API Gateway REST API
+  # Provides HTTP endpoints for the URL shortener.
+  # -------------------------------------------------------------------
+  UrlShortenerApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ServerlessUrlShortenerAPI
+      Description: API for URL shortening and redirection.
+      # Define CORS for the entire API to allow frontend interaction
+      CorsConfiguration:
+        AllowOrigins:
+          - '*' # In production, restrict this to your actual frontend domain(s)
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - X-Amz-Date
+          - Authorization
+          - X-Api-Key
+          - X-Amz-Security-Token
+
+  # API Gateway Resource: /shorten (for POST requests to shorten URLs)
+  ShortenResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref UrlShortenerApi
+      ParentId: !GetAtt UrlShortenerApi.RootResourceId
+      PathPart: shorten # This creates the /shorten path
+
+  # API Gateway Method: POST /shorten
+  ShortenMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UrlShortenerApi
+      ResourceId: !Ref ShortenResource
+      HttpMethod: POST
+      AuthorizationType: NONE # No authentication for this example (can add API Key, Cognito)
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY # Simplifies integration between API Gateway and Lambda
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ShortenUrlLambda.Arn}/invocations"
+
+  # API Gateway Resource: /{shortCode} (for GET requests to redirect)
+  RedirectResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref UrlShortenerApi
+      ParentId: !GetAtt UrlShortenerApi.RootResourceId
+      PathPart: '{shortCode}' # This captures the short code as a path parameter
+
+  # API Gateway Method: GET /{shortCode}
+  RedirectMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UrlShortenerApi
+      ResourceId: !Ref RedirectResource
+      HttpMethod: GET
+      AuthorizationType: NONE # No authentication for redirects
+      Integration:
+        IntegrationHttpMethod: POST # Lambda integration always uses POST
+        Type: AWS_PROXY
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RedirectUrlLambda.Arn}/invocations"
+
+  # API Gateway Deployment
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref UrlShortenerApi
+      Description: Initial deployment of the URL Shortener API
+    DependsOn: # Ensure methods are deployed before deployment
+      - ShortenMethod
+      - RedirectMethod
+
+  # API Gateway Stage
+  ApiGatewayStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: prod # Production stage
+      RestApiId: !Ref UrlShortenerApi
+      DeploymentId: !Ref ApiGatewayDeployment
+
+  # -------------------------------------------------------------------
+  # Permissions for API Gateway to Invoke Lambda Functions
+  # -------------------------------------------------------------------
+  ShortenLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ShortenUrlLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UrlShortenerApi}/*/*"
+
+  RedirectLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt RedirectUrlLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UrlShortenerApi}/*/*"
+
+Outputs:
+  ApiGatewayInvokeURL:
+    Description: The base URL for the API Gateway endpoint.
+    Value: !Sub "https://${UrlShortenerApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+    Export:
+      Name: UrlShortenerApiUrl
+  DynamoDBTableName:
+    Description: The name of the DynamoDB table.
+    Value: !Ref UrlMappingsTable
+  ShortenUrlLambdaArn:
+    Description: ARN of the Shorten URL Lambda function.
+    Value: !GetAtt ShortenUrlLambda.Arn
+  RedirectUrlLambdaArn:
+    Description: ARN of the Redirect URL Lambda function.
+    Value: !GetAtt RedirectUrlLambda.Arn
