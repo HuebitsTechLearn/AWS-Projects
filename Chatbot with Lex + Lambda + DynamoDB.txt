@@ -1,0 +1,149 @@
+Let’s get you started with the full codebase for your Lex + Lambda + DynamoDB chatbot system. I’ll deliver it in the following structured chunks:
+
+🧱 1. Lex Bot Configuration (to be done manually or via AWS CLI)
+Intents:
+
+BookAppointment
+
+GetOrderStatus
+
+FAQSupport
+
+Slots for BookAppointment:
+
+ServiceType (e.g., Consultation, Repair)
+
+Date (built-in AMAZON.DATE)
+
+Time (built-in AMAZON.TIME)
+
+UserName
+
+Fulfillment:
+Lambda ARN (provided in next step)
+
+You can use the AWS Console for Lex to create these intents, or I can also generate a Lex bot definition in JSON you can import. Let me know if you want that.
+
+🧠 2. Lambda Fulfillment Logic (Node.js – index.js)
+javascript
+Copy
+Edit
+const AWS = require("aws-sdk");
+const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+exports.handler = async (event) => {
+  const intent = event.currentIntent.name;
+  let response;
+
+  if (intent === "BookAppointment") {
+    const { ServiceType, Date, Time, UserName } = event.currentIntent.slots;
+    const bookingId = `appt_${Date}_${Time}_${Math.floor(Math.random() * 1000)}`;
+
+    const params = {
+      TableName: "Appointments",
+      Item: {
+        BookingId: bookingId,
+        ServiceType,
+        Date,
+        Time,
+        UserName,
+        Status: "Scheduled"
+      }
+    };
+
+    await dynamodb.put(params).promise();
+
+    response = {
+      dialogAction: {
+        type: "Close",
+        fulfillmentState: "Fulfilled",
+        message: {
+          contentType: "PlainText",
+          content: `Thanks ${UserName}, your ${ServiceType} appointment is scheduled on ${Date} at ${Time}. Your booking ID is ${bookingId}.`
+        }
+      }
+    };
+  }
+
+  return response;
+};
+🗄️ 3. DynamoDB Table (Terraform or Console)
+Table Name: Appointments
+Primary Key: BookingId (string)
+
+You can also add a GSI if you want to query by UserName later.
+
+🔐 4. IAM Role for Lambda
+Attach the following permissions:
+
+json
+Copy
+Edit
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:PutItem",
+        "dynamodb:GetItem"
+      ],
+      "Resource": "arn:aws:dynamodb:<region>:<account-id>:table/Appointments"
+    }
+  ]
+}
+🌐 5. Optional: API Gateway + Cognito
+If you'd like to expose the chatbot via custom UI:
+
+Set up an API Gateway endpoint.
+
+Protect it using Cognito User Pool authorizer.
+
+Call Lex’s PostText API from frontend.
+
+🎨 6. Frontend Integration (HTML + JS snippet)
+html
+Copy
+Edit
+<input id="userText" />
+<button onclick="sendToLex()">Send</button>
+<div id="chat"></div>
+
+<script>
+  async function sendToLex() {
+    const msg = document.getElementById("userText").value;
+    const response = await fetch("/your-api-gateway-url", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ inputText: msg })
+    });
+    const data = await response.json();
+    document.getElementById("chat").innerText += "\n" + data.message;
+  }
+</script>
+📄 7. README.md Template
+markdown
+Copy
+Edit
+# AWS Chatbot with Lex + Lambda + DynamoDB
+
+## Features
+- Intent recognition with Amazon Lex
+- Serverless business logic via Lambda
+- Persistent storage using DynamoDB
+- Easily extensible with new intents
+- API Gateway optional for custom integration
+
+## Deployment
+1. Create Lex bot with intents: BookAppointment, GetOrderStatus
+2. Deploy `index.js` to Lambda and link as Lex fulfillment
+3. Create DynamoDB table `Appointments`
+4. Add IAM Role for Lambda
+5. (Optional) Expose via API Gateway and secure with Cognito
+
+## Example Usage
+> "I want to book a repair appointment tomorrow at 3 PM"
+
+Bot responds:
+> "Thanks, your Repair appointment is scheduled for tomorrow at 3 PM."
+
