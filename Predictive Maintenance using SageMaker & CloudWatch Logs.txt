@@ -1,0 +1,134 @@
+Here's everything you need for an end-to-end Predictive Maintenance System using AWS SageMaker & CloudWatch Logs, fully aligned with what you've described and already built into your Iot Dashboard Setup project structure:
+
+✅ 1. Terraform Scripts (Infrastructure Provisioning)
+You've already deployed:
+
+AWS CloudWatch Logs
+
+AWS IoT Thing Certificates
+
+SageMaker setup with IAM permissions
+
+Timestream for time-series storage
+
+If you need to extend this for full automation:
+
+Add:
+
+aws_s3_bucket (for storing training data and model artifacts)
+
+aws_iam_role with trust policy for SageMaker
+
+aws_lambda_function resource for inference Lambda
+
+aws_cloudwatch_log_group with subscription to Lambda
+
+Let me know and I’ll append those in main.tf.
+
+📁 2. Downloadable Python Project Template Structure
+Already present in your setup:
+
+bash
+Copy
+Edit
+predictive_maintenance/
+├── lambda_predictive.py         # Inference logic via SageMaker endpoint
+├── preprocess_logs.py           # Transforms CloudWatch logs into structured features
+├── sagemaker_training.py        # Trains and deploys your predictive model
+├── train_model.py               # (You can add your custom sklearn/ML logic here)
+Plus:
+
+.env with AWS region, endpoint name, log group names
+
+requirements.txt:
+
+txt
+Copy
+Edit
+boto3
+pandas
+sagemaker
+scikit-learn
+📜 3. Grafana Dashboard JSON Export Template
+Assuming you’re ingesting from Timestream (already configured), here's a basic Grafana dashboard template to import:
+
+json
+Copy
+Edit
+{
+  "dashboard": {
+    "id": null,
+    "uid": null,
+    "title": "Predictive Maintenance Overview",
+    "timezone": "browser",
+    "panels": [
+      {
+        "type": "graph",
+        "title": "Temperature Over Time",
+        "targets": [{
+          "refId": "A",
+          "datasource": "Timestream",
+          "rawSql": "SELECT time, measure_value::double FROM sensor_metrics WHERE measure_name='temperature'"
+        }],
+        "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 }
+      },
+      {
+        "type": "graph",
+        "title": "Predicted Anomalies",
+        "targets": [{
+          "refId": "B",
+          "datasource": "CloudWatch",
+          "expression": "ANOMALY_DETECTION_BAND(m1)",
+          "region": "us-east-1"
+        }],
+        "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 }
+      }
+    ],
+    "schemaVersion": 30,
+    "version": 1
+  }
+}
+To use:
+
+Go to Grafana → Dashboards → Import
+
+Paste the JSON above or upload .json file
+
+Set your data source to Timestream or CloudWatch
+
+⚡ 4. Multi-Device Simulation
+You're already simulating 3 devices in mqtt_publisher.py.
+
+For scaling:
+
+Use multiprocessing to simulate parallel data streams.
+
+Or deploy multiple Docker containers with unique device IDs.
+
+I can generate this as code if needed.
+
+📊 5. AWS Timestream for Analytics
+You're set up with Timestream + Lambda integration.
+
+To query Timestream from Python (for analytics scripts):
+
+python
+Copy
+Edit
+import boto3
+
+client = boto3.client('timestream-query')
+
+query = """
+SELECT device_id, AVG(measure_value::double) AS avg_temp
+FROM "iot_sensors_db"."sensor_metrics"
+WHERE measure_name='temperature'
+GROUP BY device_id
+"""
+
+response = client.query(QueryString=query)
+for row in response['Rows']:
+    print([col['ScalarValue'] for col in row['Data']])
+
+
+
