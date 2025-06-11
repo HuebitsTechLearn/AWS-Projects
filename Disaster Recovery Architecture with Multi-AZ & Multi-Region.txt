@@ -1,0 +1,868 @@
+DR Architecture: Part 1 - Primary Region (CloudFormation)
+
+# -------------------------------------------------------------------
+# DR Architecture: Part 1 - Primary Region CloudFormation Template
+# This template defines the highly available (Multi-AZ) application
+# and database components in your primary AWS Region.
+#
+# To deploy:
+# 1. Save this content as `primary-region-stack.yaml`.
+# 2. Deploy via AWS CLI:
+#    aws cloudformation deploy --template-file primary-region-stack.yaml \
+#        --stack-name PrimaryRegionAppStack \
+#        --region us-east-1 # Or your chosen primary region
+# -------------------------------------------------------------------
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  CloudFormation template for a Highly Available (Multi-AZ) Application
+  and RDS deployment in the Primary AWS Region for Disaster Recovery.
+
+Parameters:
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: The ID of your existing VPC where resources will be deployed.
+  PublicSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: ID of a public subnet in AZ1 for ALB.
+  PublicSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: ID of a public subnet in AZ2 for ALB.
+  PrivateSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: ID of a private subnet in AZ1 for EC2 instances.
+  PrivateSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: ID of a private subnet in AZ2 for EC2 instances.
+  PrivateSubnet3Id: # Optional, for RDS Multi-AZ if more than 2 subnets required
+    Type: AWS::EC2::Subnet::Id
+    Description: ID of a private subnet in AZ3 for RDS.
+    Default: '' # Leave empty if only 2 subnets are used for RDS
+  
+  # Application-specific parameters
+  AppInstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type for the application servers.
+  AppAMIId:
+    Type: AWS::EC2::Image::Id
+    Description: AMI ID for the application servers (e.g., Amazon Linux 2 AMI).
+  AppDesiredCapacity:
+    Type: Number
+    Default: 2
+    Description: Desired number of application instances.
+  AppMinCapacity:
+    Type: Number
+    Default: 2
+    Description: Minimum number of application instances.
+  AppMaxCapacity:
+    Type: Number
+    Default: 4
+    Description: Maximum number of application instances.
+  
+  # RDS Database parameters
+  DBInstanceType:
+    Type: String
+    Default: db.t3.micro
+    Description: RDS DB instance type.
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+    Description: Allocated storage for the database (GB).
+  DBUsername:
+    Type: String
+    NoEcho: true
+    Description: Master username for the database.
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Description: Master password for the database.
+
+Conditions:
+  UseThreeDbSubnets: !Not [!Equals [!Ref PrivateSubnet3Id, '']] # Condition to check if third subnet is provided for RDS
+
+Resources:
+  # -------------------------------------------------------------------
+  # 1. Networking and Security Groups
+  # -------------------------------------------------------------------
+  # Security Group for Application Load Balancer
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: PrimaryAppAlbSG
+      GroupDescription: Allow HTTP/S access to ALB
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: PrimaryAppAlbSG
+
+  # Security Group for EC2 Application Instances
+  AppServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: PrimaryAppServerSG
+      GroupDescription: Allow traffic from ALB and SSH
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !GetAtt AlbSecurityGroup.GroupId # Allow HTTP from ALB
+        - IpProtocol: tcp
+          FromPort: 22 # For SSH access (consider Bastion Host in production)
+          ToPort: 22
+          CidrIp: 0.0.0.0/0 # Restrict this in production to specific IPs
+      Tags:
+        - Key: Name
+          Value: PrimaryAppServerSG
+
+  # Security Group for RDS Database
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: PrimaryDbSG
+      GroupDescription: Allow database access from application servers
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306 # MySQL default port (change for PostgreSQL, etc.)
+          ToPort: 3306
+          SourceSecurityGroupId: !GetAtt AppServerSecurityGroup.GroupId # Allow access from App Servers
+      Tags:
+        - Key: Name
+          Value: PrimaryDbSG
+
+  # -------------------------------------------------------------------
+  # 2. Application Load Balancer (ALB)
+  # -------------------------------------------------------------------
+  AppLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: PrimaryAppALB
+      Subnets:
+        - !Ref PublicSubnet1Id
+        - !Ref PublicSubnet2Id
+      SecurityGroups:
+        - !GetAtt AlbSecurityGroup.GroupId
+      Scheme: internet-facing
+      Tags:
+        - Key: Name
+          Value: PrimaryAppALB
+
+  AlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref AppLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AlbTargetGroup
+
+  AlbTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: PrimaryAppTG
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPCId
+      HealthCheckPath: /health # Replace with your application's health check endpoint
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Targets: [] # Auto Scaling Group will register instances
+
+  # -------------------------------------------------------------------
+  # 3. Auto Scaling Group for Application Instances (Multi-AZ)
+  # -------------------------------------------------------------------
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: PrimaryAppLaunchTemplate
+      LaunchTemplateData:
+        ImageId: !Ref AppAMIId
+        InstanceType: !Ref AppInstanceType
+        SecurityGroupIds:
+          - !GetAtt AppServerSecurityGroup.GroupId
+        # KeyName: your-key-pair # Optional: if you need SSH access with a key pair
+        UserData: # Example UserData to install basic web server (e.g., Nginx)
+          Fn::Base64: |
+            #!/bin/bash
+            yum update -y
+            amazon-linux-extras install -y nginx1
+            systemctl start nginx
+            systemctl enable nginx
+            echo "<h1>Hello from Primary Region!</h1>" > /usr/share/nginx/html/index.html
+            # Add application deployment script here
+
+  AppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: PrimaryAppASG
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.DefaultVersionNumber
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+      DesiredCapacity: !Ref AppDesiredCapacity
+      MinSize: !Ref AppMinCapacity
+      MaxSize: !Ref AppMaxCapacity
+      TargetGroupARNs:
+        - !Ref AlbTargetGroup
+      Tags:
+        - Key: Name
+          Value: PrimaryAppInstance
+          PropagateAtLaunch: true
+
+  # -------------------------------------------------------------------
+  # 4. RDS Database (Multi-AZ)
+  # -------------------------------------------------------------------
+  RDSSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for primary RDS instance
+      SubnetIds:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+        - !If [UseThreeDbSubnets, !Ref PrivateSubnet3Id, !Ref "AWS::NoValue"] # Conditionally add 3rd subnet
+      Tags:
+        - Key: Name
+          Value: PrimaryRDSDBSubnetGroup
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: primary-app-db
+      Engine: mysql # Or postgres, aurora, etc.
+      DBInstanceClass: !Ref DBInstanceType
+      AllocatedStorage: !Ref DBAllocatedStorage
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBSubnetGroupName: !Ref RDSSubnetGroup
+      VPCSecurityGroups:
+        - !GetAtt DbSecurityGroup.GroupId
+      MultiAZ: true # Crucial for Multi-AZ high availability
+      BackupRetentionPeriod: 7 # Days (for automated backups)
+      PreferredBackupWindow: '03:00-04:00' # UTC
+      PubliclyAccessible: false # Database should not be publicly accessible
+      Tags:
+        - Key: Name
+          Value: PrimaryRDSDB
+
+Outputs:
+  AlbDNSName:
+    Description: DNS name of the Application Load Balancer.
+    Value: !GetAtt AppLoadBalancer.DNSName
+    Export:
+      Name: PrimaryAlbDNSName
+  RDSInstanceEndpoint:
+    Description: Endpoint of the RDS instance.
+    Value: !GetAtt RDSInstance.Endpoint.Address
+    Export:
+      Name: PrimaryRDSInstanceEndpoint
+
+
+
+DR Architecture: Part 2 - Secondary Region (CloudFormation)
+
+
+# -------------------------------------------------------------------
+# DR Architecture: Part 2 - Secondary Region CloudFormation Template
+# This template defines the Disaster Recovery (DR) setup in your
+# secondary AWS Region, including RDS Read Replica (for failover)
+# and S3 Cross-Region Replication for data durability.
+#
+# To deploy:
+# 1. Save this content as `secondary-region-stack.yaml`.
+# 2. Deploy via AWS CLI in your secondary region:
+#    aws cloudformation deploy --template-file secondary-region-stack.yaml \
+#        --stack-name SecondaryRegionDRStack \
+#        --region us-west-2 # Or your chosen secondary region
+#        --parameter-overrides PrimaryRegionRdsArn=arn:aws:rds:us-east-1:123456789012:db:primary-app-db \
+#                              PrimaryRegionS3BucketName=your-primary-s3-bucket-name
+#    (Replace ARN and bucket name with outputs from your primary region)
+# -------------------------------------------------------------------
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  CloudFormation template for Disaster Recovery (DR) resources
+  in the Secondary AWS Region.
+
+Parameters:
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: The ID of your existing VPC in the secondary region.
+  PrivateSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: ID of a private subnet in AZ1 in secondary region.
+  PrivateSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: ID of a private subnet in AZ2 in secondary region.
+  # For RDS Read Replica, provide the ARN of the primary RDS instance
+  PrimaryRegionRdsArn:
+    Type: String
+    Description: ARN of the primary RDS DB Instance from the primary region (e.g., arn:aws:rds:us-east-1:123456789012:db:primary-app-db).
+  # For S3 Cross-Region Replication, provide the name of the primary S3 bucket
+  PrimaryRegionS3BucketName:
+    Type: String
+    Description: Name of the primary S3 bucket for Cross-Region Replication (e.g., my-primary-data-bucket-123).
+
+  # Application-specific parameters (for DR failover app deployment)
+  AppInstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type for the DR application servers (can be smaller than primary).
+  AppAMIId:
+    Type: AWS::EC2::Image::Id
+    Description: AMI ID for the application servers in the secondary region.
+  AppMinCapacity:
+    Type: Number
+    Default: 0 # Start with 0 or 1 for pilot light/warm standby
+    Description: Minimum number of application instances in DR.
+  AppMaxCapacity:
+    Type: Number
+    Default: 2 # Max capacity during DR scenario
+    Description: Maximum number of application instances in DR.
+
+Resources:
+  # -------------------------------------------------------------------
+  # 1. Networking and Security Groups (mirroring primary where applicable)
+  # -------------------------------------------------------------------
+  # Security Group for EC2 Application Instances in DR
+  DrAppServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: SecondaryDrAppServerSG
+      GroupDescription: Allow necessary traffic for DR application servers
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        # Define ingress for ALB/Load Balancer in DR region if you deploy one
+        # For an active-passive setup, this might be internal access only initially
+        # or from a public ALB activated during failover.
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0 # Adjust based on DR ALB or direct access
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0 # Restrict this
+      Tags:
+        - Key: Name
+          Value: SecondaryDrAppServerSG
+
+  # Security Group for RDS Read Replica in DR
+  DrDbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: SecondaryDrDbSG
+      GroupDescription: Allow database access from DR application servers
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306 # MySQL default port (change for PostgreSQL, etc.)
+          ToPort: 3306
+          SourceSecurityGroupId: !GetAtt DrAppServerSecurityGroup.GroupId # Allow access from DR App Servers
+      Tags:
+        - Key: Name
+          Value: SecondaryDrDbSG
+
+  # -------------------------------------------------------------------
+  # 2. RDS Read Replica (for cross-region data replication)
+  # -------------------------------------------------------------------
+  RDSSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for secondary RDS read replica
+      SubnetIds:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+      Tags:
+        - Key: Name
+          Value: SecondaryRDSDBSubnetGroup
+
+  RDSReadReplica:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: secondary-dr-app-db-replica
+      Engine: mysql # Must match primary engine
+      DBInstanceClass: !Ref AppInstanceType # Can be a smaller instance type than primary
+      SourceDBInstanceIdentifier: !Ref PrimaryRegionRdsArn # Link to primary RDS
+      DBSubnetGroupName: !Ref RDSSubnetGroup
+      VPCSecurityGroups:
+        - !GetAtt DrDbSecurityGroup.GroupId
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: SecondaryRDSReadReplica
+
+  # -------------------------------------------------------------------
+  # 3. S3 Bucket for Cross-Region Replication (DR data storage)
+  # -------------------------------------------------------------------
+  # Secondary S3 bucket that will receive replicated data from primary
+  DrStorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${PrimaryRegionS3BucketName}-dr-${AWS::Region}" # Unique DR bucket name
+      VersioningConfiguration:
+        Status: Enabled # Recommended for CRR
+      Tags:
+        - Key: Name
+          Value: SecondaryDRStorageBucket
+
+  # IAM Role for S3 Cross-Region Replication (Primary bucket needs permissions to replicate to this)
+  # Note: The actual CRR configuration (replication rules) is set on the SOURCE bucket,
+  #       which requires this destination bucket's ARN and an IAM role with PutObject permission
+  #       to this bucket. This role would typically be defined in the primary region's template
+  #       or directly configured on the source bucket. For simplicity here, this is the destination.
+  # The source bucket's policy should allow this role:
+  # {
+  #   "Version": "2012-10-17",
+  #   "Statement": [
+  #     {
+  #       "Effect": "Allow",
+  #       "Principal": { "AWS": "arn:aws:iam::SOURCE_ACCOUNT_ID:role/S3ReplicationRole" }, # Role defined in primary
+  #       "Action": "s3:ReplicateObject",
+  #       "Resource": "arn:aws:s3:::DESTINATION_BUCKET_NAME/*"
+  #     }
+  #   ]
+  # }
+  
+  # -------------------------------------------------------------------
+  # 4. Placeholder for DR Application Deployment (e.g., Auto Scaling Group)
+  # This ASG would be scaled up during a DR event.
+  # -------------------------------------------------------------------
+  DrAppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: SecondaryDrAppLaunchTemplate
+      LaunchTemplateData:
+        ImageId: !Ref AppAMIId
+        InstanceType: !Ref AppInstanceType
+        SecurityGroupIds:
+          - !GetAtt DrAppServerSecurityGroup.GroupId
+        # UserData for application startup and connecting to DR database
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            yum update -y
+            # Install application dependencies, pull code from S3/CodeCommit, etc.
+            # Configure application to point to the DR database endpoint
+            # Example: echo "DB_ENDPOINT=!GetAtt RDSReadReplica.Endpoint.Address" > /etc/app_config.conf
+            echo "<h1>Hello from Secondary Region - DR Site!</h1>" > /usr/share/nginx/html/index.html
+            # Add application deployment script here
+
+  DrAppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: SecondaryDrAppASG
+      LaunchTemplate:
+        LaunchTemplateId: !Ref DrAppLaunchTemplate
+        Version: !GetAtt DrAppLaunchTemplate.DefaultVersionNumber
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+      DesiredCapacity: !Ref AppMinCapacity # Typically starts at 0 or a low number (pilot light)
+      MinSize: !Ref AppMinCapacity
+      MaxSize: !Ref AppMaxCapacity
+      Tags:
+        - Key: Name
+          Value: SecondaryDrAppInstance
+          PropagateAtLaunch: true
+      # You would attach this to an ALB in the secondary region if desired,
+      # and enable auto-scaling policies to scale up during failover.
+
+Outputs:
+  RDSReadReplicaEndpoint:
+    Description: Endpoint of the RDS Read Replica instance.
+    Value: !GetAtt RDSReadReplica.Endpoint.Address
+    Export:
+      Name: SecondaryRDSReadReplicaEndpoint
+  DrStorageBucketName:
+    Description: Name of the S3 bucket for DR storage.
+    Value: !Ref DrStorageBucket
+    Export:
+      Name: SecondaryDrStorageBucketName
+
+
+
+
+DR Architecture: Part 3 - Route 53 DNS Failover (CloudFormation)
+
+
+# -------------------------------------------------------------------
+# DR Architecture: Part 3 - Route 53 DNS Failover (CloudFormation Template)
+# This template defines Route 53 health checks and a DNS Failover
+# routing policy to manage traffic between primary and secondary regions.
+#
+# To deploy:
+# 1. Save this content as `route53-failover-stack.yaml`.
+# 2. Deploy via AWS CLI in your primary region (Route 53 is global but
+#    stack deployment is regional):
+#    aws cloudformation deploy --template-file route53-failover-stack.yaml \
+#        --stack-name GlobalDRRoute53Stack \
+#        --capabilities CAPABILITY_NAMED_IAM \
+#        --parameter-overrides HostedZoneId=YOUR_HOSTED_ZONE_ID \
+#                              PrimaryAlbDNSName=PRIMARY_ALB_DNS_NAME \
+#                              SecondaryAlbDNSName=SECONDARY_ALB_DNS_NAME
+#    (Replace with actual values from your primary/secondary ALB outputs and Hosted Zone ID)
+# -------------------------------------------------------------------
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  CloudFormation template for Route 53 Health Checks and Failover
+  DNS records for a Multi-Region Disaster Recovery architecture.
+
+Parameters:
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: The Route 53 Hosted Zone ID for your domain (e.g., Z1D633QGZ9L7Y9).
+  AppDomainName:
+    Type: String
+    Default: app.yourdomain.com # The domain name for your application
+    Description: The FQDN for your application (e.g., app.example.com).
+  PrimaryAlbDNSName:
+    Type: String
+    Description: DNS name of the Application Load Balancer in the Primary Region.
+  SecondaryAlbDNSName:
+    Type: String
+    Description: DNS name of the Application Load Balancer in the Secondary (DR) Region.
+  PrimaryRegion:
+    Type: String
+    Default: us-east-1
+    Description: AWS Region of the primary ALB.
+  SecondaryRegion:
+    Type: String
+    Default: us-west-2
+    Description: AWS Region of the secondary ALB.
+
+Resources:
+  # -------------------------------------------------------------------
+  # 1. Route 53 Health Checks
+  # These health checks monitor the availability of your ALBs.
+  # -------------------------------------------------------------------
+  PrimaryAlbHealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Properties:
+      HealthCheckConfig:
+        Type: HTTP # Or HTTPS if your ALB listener is HTTPS
+        Port: 80
+        ResourcePath: /health # Your application's health check path
+        FullyQualifiedDomainName: !Ref PrimaryAlbDNSName
+        RequestInterval: 30
+        FailureThreshold: 3
+        # Add IPAddress if ALB is internal and you need specific source
+      Tags:
+        - Key: Name
+          Value: PrimaryAlbHealthCheck
+
+  SecondaryAlbHealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Properties:
+      HealthCheckConfig:
+        Type: HTTP
+        Port: 80
+        ResourcePath: /health
+        FullyQualifiedDomainName: !Ref SecondaryAlbDNSName
+        RequestInterval: 30
+        FailureThreshold: 3
+      Tags:
+        - Key: Name
+          Value: SecondaryAlbHealthCheck
+
+  # -------------------------------------------------------------------
+  # 2. Route 53 DNS Records with Failover Routing Policy
+  # -------------------------------------------------------------------
+  # Primary DNS Record
+  PrimaryAppRecordSet:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref AppDomainName
+      Type: A
+      AliasTarget:
+        HostedZoneId: !GetAtt PrimaryAppLoadBalancer.CanonicalHostedZoneID # Replace with actual ALB Hosted Zone ID if directly referencing ALB, or use external lookup
+        DNSName: !GetAtt PrimaryAppLoadBalancer.DNSName # Replace with actual ALB DNS Name if directly referencing ALB
+        # For cross-stack reference, you'd use hardcoded values or pass as parameters
+        # Example using parameters for cross-stack reference:
+        # HostedZoneId: Z35SXDOTRQ7X7K # Example Hosted Zone ID for ALB in us-east-1
+        # DNSName: !Ref PrimaryAlbDNSName
+      SetIdentifier: PrimaryAppEndpoint
+      Failover: PRIMARY
+      HealthCheckId: !Ref PrimaryAlbHealthCheck
+
+  # Secondary (DR) DNS Record
+  SecondaryAppRecordSet:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref AppDomainName
+      Type: A
+      AliasTarget:
+        HostedZoneId: !GetAtt SecondaryAppLoadBalancer.CanonicalHostedZoneID # Replace with actual ALB Hosted Zone ID in secondary region
+        DNSName: !GetAtt SecondaryAppLoadBalancer.DNSName # Replace with actual ALB DNS Name in secondary region
+        # Example using parameters for cross-stack reference:
+        # HostedZoneId: Z1LID52N5YGPNA # Example Hosted Zone ID for ALB in us-west-2
+        # DNSName: !Ref SecondaryAlbDNSName
+      SetIdentifier: SecondaryAppEndpoint
+      Failover: SECONDARY
+      HealthCheckId: !Ref SecondaryAlbHealthCheck
+
+Outputs:
+  AppDomain:
+    Description: The primary application domain name.
+    Value: !Ref AppDomainName
+  PrimaryHealthCheckId:
+    Description: The ID of the primary ALB health check.
+    Value: !Ref PrimaryAlbHealthCheck
+  SecondaryHealthCheckId:
+    Description: The ID of the secondary ALB health check.
+    Value: !Ref SecondaryAlbHealthCheck
+
+
+
+DR Architecture: Part 4 - Failover Orchestration
+
+# -------------------------------------------------------------------
+# DR Architecture: Part 4 - Failover Orchestration (AWS Lambda Python)
+# This Lambda function represents a conceptual failover orchestrator.
+# It would be triggered by a CloudWatch Alarm (e.g., if PrimaryAlbHealthCheck fails)
+# or manually.
+#
+# It performs basic failover steps:
+# 1. Promotes the RDS Read Replica in the secondary region to a standalone DB.
+# 2. (Conceptual) Scales up the application Auto Scaling Group in the secondary region.
+# 3. Updates Route 53 to point to the secondary region's ALB (if not already handled by DNS Failover).
+#
+# IMPORTANT: This is a simplified example. A real orchestrator would be
+# significantly more complex, involving state machines (Step Functions),
+# more robust error handling, and application-specific recovery steps.
+# -------------------------------------------------------------------
+
+import os
+import boto3
+import json
+import logging
+from botocore.exceptions import ClientError
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+rds_client = boto3.client('rds')
+route53_client = boto3.client('route53')
+autoscaling_client = boto3.client('autoscaling')
+
+# --- Environment Variables (configured in Lambda deployment) ---
+# Replace with actual ARNs/Names from your deployed secondary stack
+SECONDARY_RDS_READ_REPLICA_IDENTIFIER = os.environ.get('SECONDARY_RDS_READ_REPLICA_IDENTIFIER', 'secondary-dr-app-db-replica')
+SECONDARY_APP_ASG_NAME = os.environ.get('SECONDARY_APP_ASG_NAME', 'SecondaryDrAppASG')
+SECONDARY_APP_ASG_DESIRED_CAPACITY = int(os.environ.get('SECONDARY_APP_ASG_DESIRED_CAPACITY', '2')) # Capacity to scale up to
+
+# Route 53 DNS Failover parameters
+HOSTED_ZONE_ID = os.environ.get('HOSTED_ZONE_ID', 'YOUR_HOSTED_ZONE_ID') # e.g., Z1D633QGZ9L7Y9
+APP_DOMAIN_NAME = os.environ.get('APP_DOMAIN_NAME', 'app.yourdomain.com')
+PRIMARY_ALB_DNS_NAME = os.environ.get('PRIMARY_ALB_DNS_NAME', 'primary-alb-dns.elb.us-east-1.amazonaws.com') # From primary stack output
+SECONDARY_ALB_DNS_NAME = os.environ.get('SECONDARY_ALB_DNS_NAME', 'secondary-alb-dns.elb.us-west-2.amazonaws.com') # From secondary stack output
+PRIMARY_ALB_HOSTED_ZONE_ID = os.environ.get('PRIMARY_ALB_HOSTED_ZONE_ID', 'Z35SXDOTRQ7X7K') # ALB Hosted Zone ID for Primary Region
+SECONDARY_ALB_HOSTED_ZONE_ID = os.environ.get('SECONDARY_ALB_HOSTED_ZONE_ID', 'Z1LID52N5YGPNA') # ALB Hosted Zone ID for Secondary Region
+
+def promote_rds_read_replica(replica_identifier):
+    """Promotes an RDS Read Replica to a standalone DB instance."""
+    logger.info(f"Attempting to promote RDS Read Replica: {replica_identifier}")
+    try:
+        response = rds_client.promote_read_replica(
+            DBInstanceIdentifier=replica_identifier
+        )
+        logger.info(f"Promotion initiated for {replica_identifier}. Response: {response}")
+        # Wait for DB instance to be available
+        waiter = rds_client.get_waiter('db_instance_available')
+        waiter.wait(
+            DBInstanceIdentifier=replica_identifier,
+            WaiterConfig={'Delay': 30, 'MaxAttempts': 60} # Check every 30s for 30 minutes
+        )
+        logger.info(f"RDS Read Replica {replica_identifier} successfully promoted and is available.")
+        return True
+    except ClientError as e:
+        logger.error(f"Error promoting RDS Read Replica {replica_identifier}: {e}", exc_info=True)
+        return False
+
+def scale_up_autoscaling_group(asg_name, desired_capacity):
+    """Scales up a given Auto Scaling Group."""
+    logger.info(f"Attempting to scale up ASG {asg_name} to desired capacity {desired_capacity}")
+    try:
+        autoscaling_client.update_auto_scaling_group(
+            AutoScalingGroupName=asg_name,
+            DesiredCapacity=desired_capacity,
+            MinSize=desired_capacity # Ensure min is also set to desired for quick scale-up
+        )
+        logger.info(f"ASG {asg_name} scale-up initiated to {desired_capacity}.")
+        # You might want to add a waiter here for instances to be in service
+        return True
+    except ClientError as e:
+        logger.error(f"Error scaling up ASG {asg_name}: {e}", exc_info=True)
+        return False
+
+def update_route53_dns(hosted_zone_id, app_domain_name, target_alb_dns_name, target_alb_hosted_zone_id):
+    """
+    Updates a Route 53 A record (Alias) to point to the new ALB.
+    This assumes a simple active-passive switch. For more complex setups
+    (e.g., updating weighted records), the logic would change.
+    """
+    logger.info(f"Attempting to update Route 53 DNS for {app_domain_name} to {target_alb_dns_name}")
+    try:
+        response = route53_client.change_resource_record_sets(
+            HostedZoneId=hosted_zone_id,
+            ChangeBatch={
+                'Changes': [
+                    {
+                        'Action': 'UPSERT', # Update or Insert
+                        'ResourceRecordSet': {
+                            'Name': app_domain_name,
+                            'Type': 'A',
+                            'AliasTarget': {
+                                'HostedZoneId': target_alb_hosted_zone_id,
+                                'DNSName': target_alb_dns_name,
+                                'EvaluateTargetHealth': True # Evaluate health of the target ALB
+                            }
+                            # Remove SetIdentifier, Failover if you are switching from Failover to simple A record
+                            # For pure Failover policy managed by R53, this function might not be needed
+                            # as R53 handles failover automatically based on health checks.
+                            # This is for manual override or a different DNS strategy.
+                        }
+                    }
+                ]
+            }
+        )
+        logger.info(f"Route 53 DNS update initiated. Response: {response}")
+        return True
+    except ClientError as e:
+        logger.error(f"Error updating Route 53 DNS record for {app_domain_name}: {e}", exc_info=True)
+        return False
+
+def lambda_handler(event, context):
+    """
+    Main Lambda handler for DR failover orchestration.
+    Can be triggered by a CloudWatch Alarm or directly.
+    """
+    logger.info(f"Disaster Recovery Failover Lambda triggered with event: {json.dumps(event)}")
+
+    # Step 1: Promote RDS Read Replica (if applicable)
+    # This assumes the read replica is already in the secondary region.
+    if not promote_rds_read_replica(SECONDARY_RDS_READ_REPLICA_IDENTIFIER):
+        logger.critical("Failed to promote RDS Read Replica. Failover aborted.")
+        return {'statusCode': 500, 'body': 'RDS Promotion Failed'}
+
+    # Step 2: Scale up Secondary Application ASG
+    if not scale_up_autoscaling_group(SECONDARY_APP_ASG_NAME, SECONDARY_APP_ASG_DESIRED_CAPACITY):
+        logger.critical("Failed to scale up secondary ASG. Failover might be incomplete.")
+        # Decide if this is a hard stop or if DNS update should still proceed
+
+    # Step 3: Update Route 53 DNS (only if not using R53 Failover policy already)
+    # If using R53 Failover policy, this step might be redundant as R53 handles DNS switch automatically.
+    # This is for a scenario where you might manually update DNS or for a different routing policy.
+    # For a *true* R53 Failover setup, the DNS simply resolves to the healthy endpoint.
+    # For demonstration purposes, we'll keep it here, but in a real R53 Failover, this isn't needed.
+    # if not update_route53_dns(HOSTED_ZONE_ID, APP_DOMAIN_NAME, SECONDARY_ALB_DNS_NAME, SECONDARY_ALB_HOSTED_ZONE_ID):
+    #     logger.critical("Failed to update Route 53 DNS. Traffic redirection might be affected.")
+
+    logger.info("Disaster Recovery Failover process completed. Monitor your application status.")
+    return {
+        'statusCode': 200,
+        'body': json.dumps('DR Failover initiated successfully. Further monitoring recommended.')
+    }
+
+
+
+
+DR Architecture: Deployment Notes & Next Steps
+
+
+Deployment Notes and Critical Next Steps
+Building a robust Multi-AZ and Multi-Region Disaster Recovery architecture is a multi-step process that requires careful planning and testing. The provided CloudFormation templates are conceptual blueprints.
+
+Pre-Deployment:
+
+VPC and Subnets: Ensure you have existing VPCs and at least two private subnets (preferably in different AZs) in both your primary and secondary regions. For the primary region, you'll also need two public subnets for the ALB.
+
+AMI IDs: Replace placeholder AMI IDs (AppAMIId) with actual, relevant AMI IDs for your chosen region and OS. Ideally, build custom AMIs for your application servers.
+
+Application Code: The EC2 instances will need your application code. This can be baked into the AMI, pulled from S3/CodeCommit in UserData, or deployed via CodeDeploy (which would require CodeDeploy agents on the instances).
+
+Database Configuration: Ensure your RDS instance type, allocated storage, engine (MySQL, PostgreSQL, etc.), master username, and password are correct.
+
+S3 Buckets for Lambda Code: Create an S3 bucket (e.g., your-lambda-code-deployment-bucket) to store the zipped Lambda deployment packages.
+
+Package Lambda Code:
+
+For failover_orchestrator_lambda/lambda_function.py:
+
+cd failover_orchestrator_lambda
+zip -r ../failover_orchestrator_lambda.zip .
+cd ..
+aws s3 cp failover_orchestrator_lambda.zip s3://your-lambda-code-deployment-bucket/
+
+Route 53 Hosted Zone: You need an existing Public Hosted Zone in Route 53 for your domain (e.g., yourdomain.com). Obtain its HostedZoneId.
+
+Deployment Order:
+
+Deploy Primary Region Stack:
+
+Deploy primary-region-stack.yaml in your primary AWS Region (e.g., us-east-1).
+
+Capture Outputs: Note the AlbDNSName and RDSInstanceEndpoint from the outputs of this stack.
+
+Deploy Secondary Region Stack:
+
+Deploy secondary-region-stack.yaml in your secondary AWS Region (e.g., us-west-2).
+
+Provide Primary Region Outputs: Pass the PrimaryRegionRdsArn (ARN of the primary RDS instance) and PrimaryRegionS3BucketName (name of the S3 bucket in the primary region) as parameters to this stack. These are essential for setting up cross-region replication.
+
+Capture Outputs: Note the RDSReadReplicaEndpoint and DrStorageBucketName.
+
+Configure S3 Cross-Region Replication (CRR) on Primary Bucket:
+
+Manually (or via a separate CloudFormation update to the primary stack) configure the S3 bucket in your primary region to replicate objects to the DrStorageBucketName created in the secondary region. This requires an IAM Role that S3 can assume to replicate.
+
+Deploy Route 53 Failover Stack:
+
+Deploy route53-failover-stack.yaml in your primary region (Route 53 is a global service, but CloudFormation deployment is regional).
+
+Provide Parameters: Pass the HostedZoneId, AppDomainName, PrimaryAlbDNSName, and SecondaryAlbDNSName (from the outputs of your ALB deployments in primary/secondary regions).
+
+Configure CloudWatch Alarms (for Automated Failover):
+
+Create CloudWatch Alarms that monitor critical metrics (e.g., ALB health check failures, EC2 CPU utilization, application error rates) in your primary region.
+
+Configure these alarms to trigger the FailoverOrchestratorLambda via an SNS Topic.
+
+Post-Deployment & Testing:
+
+Verify Endpoints: Confirm that your primary application (via ALB DNS) is accessible.
+
+Verify Replication: Check that the RDS Read Replica is in sync with the primary, and S3 objects are replicating across regions.
+
+DR Drill (Crucial!):
+
+Simulate Primary AZ Failure: Manually terminate all EC2 instances in one AZ in the primary region. Observe if traffic fails over to the other AZ and if the ASG replaces instances.
+
+Simulate Primary Region Failure:
+
+Trigger your FailoverOrchestratorLambda (either manually or by simulating a major outage that triggers its CloudWatch Alarm).
+
+Observe the RDS Read Replica promotion, ASG scale-up in the secondary region, and DNS updates.
+
+Verify that traffic is now routed to the secondary region's application.
+
+Failback Plan: Design and test a failback plan to return traffic and data to the primary region once the issue is resolved. This is often more complex than failover.
+
+Monitoring & Alerting: Ensure CloudWatch dashboards are set up to monitor the health and performance of all components in both regions.
+
+This comprehensive setup demonstrates true enterprise-grade disaster recovery in the clou
