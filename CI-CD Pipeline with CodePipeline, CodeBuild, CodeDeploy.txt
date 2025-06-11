@@ -1,0 +1,800 @@
+A complete, production-ready CI/CD pipeline requires an actual application to deploy. Since I don't have your specific application code, I will provide you with a comprehensive set of CloudFormation templates to set up the entire CI/CD infrastructure, along with placeholder files for a very simple sample web application. This will give you a solid working foundation that you can then adapt for your own projects.
+
+We'll break this down into three main parts:
+
+Part 1: Sample Application Infrastructure (CloudFormation) - This template defines the target environment (VPC, ALB, EC2 Auto Scaling Group) where your CI/CD pipeline will deploy the application.
+Part 2: CI/CD Pipeline Infrastructure (CloudFormation) - This template sets up the core CI/CD services: AWS CodeCommit (source), AWS CodeBuild (build), AWS CodeDeploy (deployment), and AWS CodePipeline (orchestration).
+Part 3: Sample Application Code & Configuration Files - These are the basic files (index.html, buildspec.yml, appspec.yml) that you'd place in your CodeCommit repository for the pipeline to process.
+
+
+CI/CD Project: Part 1 - Sample Application Infrastructure (CloudFormation)
+
+# -------------------------------------------------------------------
+# CI/CD Project: Part 1 - Sample Application Infrastructure (CloudFormation)
+#
+# This template defines the target environment for your CI/CD pipeline.
+# It sets up a VPC, public subnets, an Application Load Balancer (ALB),
+# security groups, and an EC2 Auto Scaling Group (ASG) to host a simple web app.
+#
+# To deploy:
+# 1. Save this content as `sample-app-infra.yaml`.
+# 2. Deploy via AWS CLI:
+#    aws cloudformation deploy --template-file sample-app-infra.yaml \
+#        --stack-name SampleWebAppInfrastructure \
+#        --capabilities CAPABILITY_IAM \
+#        --region us-east-1 # Or your desired region
+# 3. Note the outputs, especially the ALB DNS Name.
+# -------------------------------------------------------------------
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  CloudFormation template for a sample web application infrastructure,
+  acting as the target for a CI/CD pipeline.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: SampleWebApp
+    Description: A name for this project, used in resource naming.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type for the application servers.
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-2-latest/amzn2-ami-hvm-x86_64-gp2 # Latest Amazon Linux 2 AMI
+    Description: The latest Amazon Linux 2 AMI ID.
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+    Description: Desired number of application instances.
+  MinCapacity:
+    Type: Number
+    Default: 2
+    Description: Minimum number of application instances.
+  MaxCapacity:
+    Type: Number
+    Default: 4
+    Description: Maximum number of application instances.
+
+Resources:
+  # -------------------------------------------------------------------
+  # 1. VPC and Networking
+  # -------------------------------------------------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-VPC"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Tags:
+      - Key: Name
+        Value: !Sub "${ProjectName}-IGW"
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ''] # First AZ in region
+      MapPublicIpOnLaunch: true # Allows public IPs for instances
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-PublicSubnet1"
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ''] # Second AZ in region
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-PublicSubnet2"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-PublicRT"
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # -------------------------------------------------------------------
+  # 2. Security Groups
+  # -------------------------------------------------------------------
+  # Security Group for Application Load Balancer
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-AlbSG"
+      GroupDescription: Allow HTTP/S access to ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-AlbSG"
+
+  # Security Group for EC2 Application Instances
+  AppServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-AppServerSG"
+      GroupDescription: Allow traffic from ALB and SSH (for debugging)
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !GetAtt AlbSecurityGroup.GroupId # Allow HTTP from ALB
+        - IpProtocol: tcp
+          FromPort: 22 # For SSH access (consider Bastion Host in production)
+          ToPort: 22
+          CidrIp: 0.0.0.0/0 # RESTRICT THIS IN PRODUCTION TO SPECIFIC IP RANGES
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-AppServerSG"
+
+  # -------------------------------------------------------------------
+  # 3. Application Load Balancer (ALB)
+  # -------------------------------------------------------------------
+  AppLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-ALB"
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !GetAtt AlbSecurityGroup.GroupId
+      Scheme: internet-facing
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-ALB"
+
+  AlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref AppLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AlbTargetGroup
+
+  AlbTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-TG"
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      HealthCheckPath: /index.html # Simple health check for static content
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Targets: [] # Auto Scaling Group will register instances
+
+  # -------------------------------------------------------------------
+  # 4. Auto Scaling Group for Application Instances
+  # -------------------------------------------------------------------
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ProjectName}-LT"
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        SecurityGroupIds:
+          - !GetAtt AppServerSecurityGroup.GroupId
+        # UserData for installing CodeDeploy Agent and a web server
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y ruby wget
+            # Install Nginx as a simple web server
+            amazon-linux-extras install -y nginx1
+            systemctl enable nginx
+            systemctl start nginx
+            # Install CodeDeploy agent
+            wget https://aws-codedeploy-${AWS::Region}.s3.${AWS::Region}.amazonaws.com/latest/install
+            chmod +x ./install
+            ./install auto
+            systemctl start codedeploy-agent
+            systemctl enable codedeploy-agent
+
+  AppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${ProjectName}-ASG"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.DefaultVersionNumber
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      DesiredCapacity: !Ref DesiredCapacity
+      MinSize: !Ref MinCapacity
+      MaxSize: !Ref MaxCapacity
+      TargetGroupARNs:
+        - !Ref AlbTargetGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-Instance"
+          PropagateAtLaunch: true
+
+Outputs:
+  AlbDNSName:
+    Description: DNS name of the Application Load Balancer.
+    Value: !GetAtt AppLoadBalancer.DNSName
+    Export:
+      Name: !Sub "${ProjectName}AlbDNSName"
+  AppServerSecurityGroupId:
+    Description: Security Group ID for application servers.
+    Value: !GetAtt AppServerSecurityGroup.GroupId
+    Export:
+      Name: !Sub "${ProjectName}AppServerSecurityGroupId"
+  AppAutoScalingGroupName:
+    Description: Name of the Auto Scaling Group.
+    Value: !Ref AppAutoScalingGroup
+    Export:
+      Name: !Sub "${ProjectName}AppAutoScalingGroupName"
+  VPCId:
+    Description: The ID of the VPC created.
+    Value: !Ref VPC
+    Export:
+      Name: !Sub "${ProjectName}VPCId"
+
+
+CI/CD Project: Part 2 - CI/CD Pipeline Infrastructure (CloudFormation)
+
+
+# -------------------------------------------------------------------
+# CI/CD Project: Part 2 - CI/CD Pipeline Infrastructure (CloudFormation)
+#
+# This template defines the CodeCommit repository, IAM roles, CodeBuild project,
+# CodeDeploy application/deployment group, and the CodePipeline.
+#
+# To deploy:
+# 1. Save this content as `cicd-pipeline-infra.yaml`.
+# 2. Deploy via AWS CLI AFTER `sample-app-infra.yaml` is deployed:
+#    aws cloudformation deploy --template-file cicd-pipeline-infra.yaml \
+#        --stack-name CICDPipelineStack \
+#        --capabilities CAPABILITY_NAMED_IAM \
+#        --region us-east-1 # Or your desired region (must match app infra region)
+#        --parameter-overrides AppAutoScalingGroupName=SampleWebApp-ASG # From Part 1 output
+#                              AppServerSecurityGroupId=sg-xxxxxxxxxxxxx # From Part 1 output
+#                              VPCId=vpc-xxxxxxxxxxxxx # From Part 1 output
+#
+# IMPORTANT:
+# - Replace placeholder values with outputs from Part 1's stack.
+# - This pipeline is designed to deploy a web application to EC2 instances managed by an ASG.
+# -------------------------------------------------------------------
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  CloudFormation template for a CI/CD pipeline using AWS CodeCommit,
+  CodeBuild, CodeDeploy, and CodePipeline.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: SampleWebApp
+    Description: A name for this project, used in resource naming.
+  AppAutoScalingGroupName:
+    Type: String
+    Description: Name of the Auto Scaling Group where the application will be deployed.
+  AppServerSecurityGroupId:
+    Type: String
+    Description: Security Group ID attached to your EC2 app instances.
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: The ID of the VPC where your EC2 instances are located.
+
+Resources:
+  # -------------------------------------------------------------------
+  # 1. AWS CodeCommit Repository (Source Stage)
+  # -------------------------------------------------------------------
+  CodeRepo:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Sub "${ProjectName}-Repo"
+      RepositoryDescription: Source code repository for the !Ref ProjectName web application.
+
+  # -------------------------------------------------------------------
+  # 2. IAM Roles for CI/CD Services
+  # -------------------------------------------------------------------
+  # CodePipeline Role
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codepipeline.amazonaws.com }
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: CodePipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:PutObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${CodePipelineArtifactStore}/"
+                  - !Sub "arn:aws:s3:::${CodePipelineArtifactStore}/*"
+              - Effect: Allow
+                Action:
+                  - codedeploy:*
+                  - codebuild:*
+                  - codecommit:*
+                  - iam:PassRole # Allow CodePipeline to pass roles to other services
+                  - cloudwatch:*
+                Resource: '*' # Be more granular in production
+
+  # CodeBuild Role
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}-BuildProject:*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:PutObjectAcl # Required for CodeDeploy artifacts
+                Resource:
+                  - !Sub "arn:aws:s3:::${CodePipelineArtifactStore}/"
+                  - !Sub "arn:aws:s3:::${CodePipelineArtifactStore}/*"
+              - Effect: Allow
+                Action:
+                  - codecommit:GitPull
+                  - codecommit:GetBranch
+                Resource: !GetAtt CodeRepo.Arn
+
+  # CodeDeploy Role
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codedeploy.amazonaws.com }
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: CodeDeployPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeTags
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                Resource: '*' # Restrict to specific S3 buckets/folders in production
+              - Effect: Allow
+                Action:
+                  - autoscaling:UpdateAutoScalingGroup
+                  - autoscaling:PutLifecycleHook
+                  - autoscaling:DeleteLifecycleHook
+                  - autoscaling:CompleteLifecycleAction
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:DescribeAutoScalingInstances
+                  - autoscaling:DescribeLifecycleHooks
+                  - autoscaling:DescribeTags
+                Resource: '*' # Restrict to specific ASG ARNs in production
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                  - sns:Subscribe
+                Resource: '*' # For notifications
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+
+  # Instance Profile Role for EC2 instances to allow CodeDeploy agent access
+  InstanceProfileRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforAWSCodeDeployLimited # Basic CodeDeploy access
+      Policies:
+        - PolicyName: EC2S3AccessForCodeDeploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: '*' # Restrict to specific S3 buckets where artifacts are stored
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${ProjectName}-InstanceProfile"
+      Roles:
+        - !Ref InstanceProfileRole
+  
+  # Ensure the ASG uses this instance profile (update ASG CloudFormation or manually if needed)
+  # You would update the ASG's Launch Template (from Part 1) to use this InstanceProfile.
+  # This CloudFormation does NOT update the ASG from Part 1. You need to do this manually
+  # or add a Custom Resource to update the ASG or redeploy Part 1 with this InstanceProfile.
+
+  # -------------------------------------------------------------------
+  # 3. AWS CodeBuild Project (Build Stage)
+  # -------------------------------------------------------------------
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${ProjectName}-BuildProject"
+      Description: Builds and packages the !Ref ProjectName application.
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE # Output artifacts to CodePipeline
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0 # Or specific image for your language
+      Source:
+        Type: CODEPIPELINE # Source from CodePipeline
+      TimeoutInMinutes: 10
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-BuildProject"
+
+  # -------------------------------------------------------------------
+  # 4. AWS CodeDeploy Application and Deployment Group (Deploy Stage)
+  # -------------------------------------------------------------------
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub "${ProjectName}-App"
+      ComputePlatform: Server # For EC2/On-Premises deployment
+
+  CodeDeployDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: !Sub "${ProjectName}-DeploymentGroup"
+      ServiceRole: !GetAtt CodeDeployRole.Arn
+      DeploymentConfigName: CodeDeployDefault.OneAtATime # Or CodeDeployDefault.AllAtOnce, CodeDeployDefault.HalfAtATime
+      AutoScalingGroups:
+        - !Ref AppAutoScalingGroupName # Reference the ASG from Part 1
+      Ec2TagSet: # Alternative: Deploy to instances with specific tags if not using ASG
+        Ec2TagSetList:
+          - Ec2TagGroup:
+              - Key: Name
+                Value: !Sub "${ProjectName}-Instance" # Tag applied by Part 1 ASG
+                Type: KEY_AND_VALUE
+      DeploymentStyle: # For Blue/Green, switch to BLUE_GREEN
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+        DeploymentType: IN_PLACE # Deploy in place
+      # LoadBalancerInfo: # Uncomment and configure for Blue/Green deployments
+      #   TargetGroupInfoList:
+      #     - TargetGroupName: !ImportValue !Sub "${ProjectName}AppTargetGroupName" # Requires export from Part 1
+      #     - TargetGroupName: !ImportValue !Sub "${ProjectName}AppTargetGroupNameBlue" # For Blue/Green
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-DeploymentGroup"
+
+  # -------------------------------------------------------------------
+  # 5. AWS CodePipeline (Orchestration)
+  # -------------------------------------------------------------------
+  CodePipelineArtifactStore:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete # Or Retain for production
+    Properties:
+      BucketName: !Sub "${ProjectName}-codepipeline-artifacts-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256 # Best practice for artifact storage
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-PipelineArtifactStore"
+
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${ProjectName}-Pipeline"
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref CodePipelineArtifactStore
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              OutputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                RepositoryName: !Ref CodeRepo
+                BranchName: main # Or your main development branch
+                PollForSourceChanges: true # Recommended for CodeCommit to detect changes
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ProjectName: !Ref BuildProject
+              RunOrder: 1
+        - Name: Deploy
+          Actions:
+            - Name: Deploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CodeDeploy
+                Version: '1'
+              InputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ApplicationName: !Ref CodeDeployApplication
+                DeploymentGroupName: !Ref CodeDeployDeploymentGroup
+              RunOrder: 1
+
+Outputs:
+  CodeCommitRepositoryCloneUrlHttp:
+    Description: HTTP URL to clone the CodeCommit repository.
+    Value: !GetAtt CodeRepo.CloneUrlHttp
+  CodePipelineConsoleUrl:
+    Description: URL to view the CodePipeline in the AWS Console.
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${ProjectName}-Pipeline/view?region=${AWS::Region}"
+
+
+
+
+CI/CD Project: Part 3 - Sample Application Code & Configuration Files
+
+
+# -------------------------------------------------------------------
+# CI/CD Project: Part 3 - Sample Application Code & Configuration Files
+#
+# These are the files you would place in your CodeCommit repository
+# (created in Part 2) for the CI/CD pipeline to process.
+#
+# File structure in your CodeCommit repository:
+# my-sample-web-app/
+# ├── index.html
+# ├── buildspec.yml
+# └── appspec.yml
+#
+# -------------------------------------------------------------------
+
+# --- File: my-sample-web-app/index.html ---
+# A very basic HTML file that Nginx will serve.
+#
+# To create this file:
+# echo "<h1>Hello from CI/CD Pipeline! Version 1</h1>" > index.html
+#
+#####################################################################
+# --- File: my-sample-web-app/buildspec.yml ---
+# This file is used by AWS CodeBuild to define the build steps.
+# It simply zips the index.html for CodeDeploy.
+#
+# To create this file:
+# cat <<EOL > buildspec.yml
+version: 0.2
+
+phases:
+  install:
+    commands:
+      # No specific install commands needed for a simple HTML file.
+      # For a real app, you would install dependencies here (e.g., npm install, pip install).
+      - echo "Installing dependencies (if any)..."
+  build:
+    commands:
+      # Create a deployment package (zip file) that CodeDeploy expects.
+      # The appspec.yml must be at the root of this zip.
+      - echo "Zipping application artifacts..."
+      - zip -r my-web-app.zip . -x "*_cache*" "*Thumbs.db*" "*.git*" "*.DS_Store*"
+artifacts:
+  files:
+    # This specifies the artifacts that CodeBuild will output to CodePipeline.
+    # CodeDeploy will then use this zip file.
+    - my-web-app.zip
+# EOL
+#####################################################################
+# --- File: my-sample-web-app/appspec.yml ---
+# This file is used by AWS CodeDeploy to define how the application
+# should be deployed to the EC2 instances.
+#
+# To create this file:
+# cat <<EOL > appspec.yml
+version: 0.0
+os: linux
+files:
+  - source: /index.html       # Source file from the CodeBuild artifact
+    destination: /usr/share/nginx/html/ # Destination on the EC2 instance (Nginx web root)
+permissions:
+  - object: /usr/share/nginx/html/index.html
+    pattern: "**"
+    owner: root
+    group: root
+    mode: 755
+hooks:
+  # These are lifecycle hooks where you can run scripts before/after deployment stages.
+  # For a simple static file, we just need to ensure Nginx serves the new file.
+  ApplicationStart:
+    - location: scripts/start_nginx.sh # Example: a script to restart/reload Nginx
+      timeout: 60
+      runas: root
+  # Add other hooks like BeforeInstall, AfterInstall, AfterAllowTraffic, ValidateService
+# EOL
+#####################################################################
+# --- File: my-sample-web-app/scripts/start_nginx.sh ---
+# A simple script to ensure Nginx serves the new content.
+# This script would be placed in the `scripts` subdirectory within your CodeCommit repo.
+#
+# To create this file:
+# mkdir scripts
+# echo "sudo systemctl restart nginx" > scripts/start_nginx.sh
+# chmod +x scripts/start_nginx.sh
+#
+#####################################################################
+
+# General Steps to get these files into CodeCommit:
+# 1. Initialize a local Git repository: `git init`
+# 2. Create the files and directories: `mkdir my-sample-web-app && cd my-sample-web-app`
+#    Then `touch index.html buildspec.yml appspec.yml` and copy content into them.
+#    And `mkdir scripts && touch scripts/start_nginx.sh` and copy content.
+# 3. Add files: `git add .`
+# 4. Commit changes: `git commit -m "Initial commit of sample web app"`
+# 5. Get CodeCommit repository URL (from Part 2 outputs or AWS Console).
+# 6. Add remote: `git remote add origin YOUR_CODECOMMIT_REPO_HTTP_URL`
+# 7. Push to CodeCommit: `git push -u origin main` (or `master` if that's your default branch)
+
+
+
+Deployment and Testing Steps:
+Deploy Part 1 (Sample Application Infrastructure):
+
+Save the code from "CI/CD Project: Part 1 - Sample Application Infrastructure" as sample-app-infra.yaml.
+Deploy it using the AWS CLI in your desired region:
+Bash
+
+aws cloudformation deploy --template-file sample-app-infra.yaml \
+    --stack-name SampleWebAppInfrastructure \
+    --capabilities CAPABILITY_IAM \
+    --region us-east-1 # or your chosen region
+Important: Note down the outputs, especially AlbDNSName, AppAutoScalingGroupName, AppServerSecurityGroupId, and VPCId. You'll need these for Part 2.
+Update EC2 Instance Profile (Crucial Step!):
+
+The ASG instances need permission to download artifacts from S3 (where CodeDeploy puts them) and report status to CodeDeploy.
+Go to the EC2 console -> IAM Roles. Find the SampleWebApp-InstanceProfile created by Part 2 (it might not be directly created by Part 1, but it's where the CodeDeploy agent runs).
+Crucially, you need to associate the InstanceProfileRole (from Part 2) with the Launch Template (SampleWebApp-LT) that your SampleWebApp-ASG uses. You might need to either:
+Manually modify the Launch Template in the EC2 console to assign the SampleWebApp-InstanceProfile.
+Or, add a AWS::AutoScaling::LaunchConfiguration (older method) to Part 1 and attach the IamInstanceProfile directly.
+The provided sample-app-infra.yaml will create the Launch Template, but you'll need to manually ensure the ASG's instances are launched with a role that has the necessary CodeDeploy agent permissions. The simplest way is to ensure the instance profile created in Part 2 is attached to the ASG's instances.
+Deploy Part 2 (CI/CD Pipeline Infrastructure):
+
+Save the code from "CI/CD Project: Part 2 - CI/CD Pipeline Infrastructure" as cicd-pipeline-infra.yaml.
+Deploy it using the AWS CLI in the same region as Part 1, providing the parameters from Part 1's outputs:
+Bash
+
+aws cloudformation deploy --template-file cicd-pipeline-infra.yaml \
+    --stack-name CICDPipelineStack \
+    --capabilities CAPABILITY_NAMED_IAM \
+    --region us-east-1 \
+    --parameter-overrides AppAutoScalingGroupName=YOUR_ASG_NAME_FROM_PART1 \
+                          AppServerSecurityGroupId=YOUR_APP_SG_ID_FROM_PART1 \
+                          VPCId=YOUR_VPC_ID_FROM_PART1
+Important: Note down the CodeCommitRepositoryCloneUrlHttp and CodePipelineConsoleUrl from the outputs of this stack.
+Populate CodeCommit Repository (Part 3):
+
+Create the file structure as described in "CI/CD Project: Part 3 - Sample Application Code & Configuration Files" on your local machine (my-sample-web-app/index.html, buildspec.yml, appspec.yml, scripts/start_nginx.sh).
+Use Git commands to push these files to your newly created CodeCommit repository.
+Bash
+
+cd my-sample-web-app
+git init
+git add .
+git commit -m "Initial commit of sample web app"
+git remote add origin YOUR_CODECOMMIT_REPO_HTTP_URL # Use the URL from Part 2 output
+git push -u origin main # Or 'master' if that's your default branch
+As soon as you push, the CodePipeline should automatically detect the change and start executing!
+Monitor and Verify:
+
+Open the CodePipelineConsoleUrl (from Part 2 outputs) in your browser to watch the pipeline execute through its Source, Build, and Deploy stages.
+Check AWS CloudWatch Logs for CodeBuild and CodeDeploy to see detailed logs of their execution.
+Once the pipeline is successful, access your application using the AlbDNSName (from Part 1 outputs) in your browser. You should see "Hello from CI/CD Pipeline! Version 1".
+Test a Change:
+
+Modify index.html locally (e.g., change "Version 1" to "Version 2").
+Commit and push the change to CodeCommit: git add . && git commit -m "Update to Version 2" && git push
+Observe the pipeline automatically starting again, building, and deploying the new version. Refresh your browser to see "Hello from CI/CD Pipeline! Version 2".
+This setup will provide a solid, hands-on experience with AWS CI/CD. Remember that the application code and deployment scripts are simplified, and a real-world application would involve more complex buildspec.yml and appspec.yml configurations.
