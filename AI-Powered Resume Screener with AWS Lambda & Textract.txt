@@ -1,0 +1,2109 @@
+1. Infrastructure as Code (IaC) - Conceptual CloudFormation/CDK Outline
+For a robust project, you should define your infrastructure using IaC. Here's a conceptual outline of what you'd define (not full YAML/TS):
+YAML
+# Conceptual CloudFormation/CDK Resources
+Resources:
+  # S3 Bucket for Resume Uploads
+  ResumeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: your-resume-upload-bucket-unique-name # Must be globally unique
+
+  # DynamoDB Table for Storing Processed Resume Data
+  ResumeDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ProcessedResumes
+      AttributeDefinitions:
+        - AttributeName: resumeId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: resumeId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST # Or ProvisionedThroughput
+
+  # SNS Topic for HR Notifications
+  HRNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: HRResumeNotifications
+      DisplayName: HR Alerts
+
+  # IAM Role for Lambda Function 1 (S3 Trigger -> Textract)
+  ResumeProcessorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ResumeProcessorPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: !GetAtt ResumeBucket.Arn # Access to the S3 bucket
+              - Effect: Allow
+                Action:
+                  - textract:StartDocumentAnalysis
+                  - textract:GetDocumentAnalysis
+                  - textract:StartDocumentTextDetection
+                  - textract:GetDocumentTextDetection
+                Resource: '*' # Textract APIs (can be tightened if specific ARNs available)
+              - Effect: Allow
+                Action: lambda:InvokeFunction # To invoke the next Lambda in chain
+                Resource: !GetAtt ResumeAnalyzerLambda.Arn # Reference to the next Lambda
+
+  # IAM Role for Lambda Function 2 (Textract Result -> Analyze -> Store/Notify)
+  ResumeAnalyzerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ResumeAnalyzerPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt ResumeDataTable.Arn # Write to DynamoDB
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref HRNotificationTopic # Publish to SNS topic
+
+  # Lambda Function 1: Triggered by S3, Invokes Textract
+  S3ToTextractLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: S3ToTextractProcessor
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt ResumeProcessorLambdaRole.Arn
+      Timeout: 300 # Adjust as needed
+      Environment:
+        Variables:
+          ANALYZE_LAMBDA_ARN: !GetAtt ResumeAnalyzerLambda.Arn # Pass next Lambda ARN
+      Code:
+        S3Bucket: your-code-deploy-bucket # S3 bucket where your Lambda deployment package resides
+        S3Key: s3_to_textract_lambda.zip
+
+  # Lambda Function 2: Processes Textract Output, Analyzes, Stores, Notifies
+  ResumeAnalyzerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ResumeDataAnalyzer
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt ResumeAnalyzerLambdaRole.Arn
+      Timeout: 300 # Adjust as needed
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME: !Ref ResumeDataTable
+          SNS_TOPIC_ARN: !Ref HRNotificationTopic
+      Code:
+        S3Bucket: your-code-deploy-bucket # S3 bucket where your Lambda deployment package resides
+        S3Key: resume_analyzer_lambda.zip
+
+  # S3 Event Notification to trigger the first Lambda
+  S3BucketNotification:
+    Type: AWS::S3::BucketNotificationConfiguration
+    Properties:
+      Bucket: !Ref ResumeBucket
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt S3ToTextractLambda.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .pdf # Or .docx, .jpg etc.
+________________________________________
+2. Python Lambda Function 1: s3_to_textract_lambda.py
+This Lambda function is triggered by an S3 object creation event. It initiates an asynchronous Textract analysis job.
+Python
+import os
+import boto3
+import json
+import logging
+import uuid # For unique job IDs if needed, or use S3 key
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+s3 = boto3.client('s3')
+textract = boto3.client('textract')
+lambda_client = boto3.client('lambda')
+
+# Get the ARN of the next Lambda from environment variables
+ANALYZE_LAMBDA_ARN = os.environ.get('ANALYZE_LAMBDA_ARN')
+
+def lambda_handler(event, context):
+    logger.info(f"Received S3 event: {json.dumps(event)}")
+
+    # Get bucket name and file key from the S3 event
+    for record in event['Records']:
+        bucket_name = record['s3']['bucket']['name']
+        object_key = record['s3']['object']['key']
+
+        logger.info(f"Processing object: s3://{bucket_name}/{object_key}")
+
+        try:
+            # Start asynchronous document analysis with Textract
+            # Use 'StartDocumentAnalysis' for forms/tables or 'StartDocumentTextDetection' for just text
+            response = textract.start_document_analysis(
+                DocumentLocation={
+                    'S3Object': {
+                        'Bucket': bucket_name,
+                        'Name': object_key
+                    }
+                },
+                Features=['FORMS', 'TABLES'], # You might only need ['FORMS'] or nothing for just text
+                NotificationChannel={
+                    'SNSTopicArn': 'arn:aws:sns:REGION:ACCOUNT_ID:TEXTRACT_STATUS_TOPIC', # <--- IMPORTANT: Create an SNS Topic for Textract job status
+                    'RoleArn': 'arn:aws:iam::ACCOUNT_ID:role/TEXTRACT_SERVICE_ROLE' # <--- IMPORTANT: Create an IAM role for Textract to publish to SNS
+                },
+                # You can pass clientRequestToken or jobId here if you want to track it
+                # ClientRequestToken=str(uuid.uuid4())
+            )
+            job_id = response['JobId']
+            logger.info(f"Textract analysis started for {object_key} with JobId: {job_id}")
+
+            # Optionally, you can directly invoke the next Lambda here
+            # if you prefer synchronous processing for smaller files, or if Textract's
+            # completion notification invokes the next Lambda (preferred for large files).
+            # For asynchronous (preferred resume screening), Textract's SNS notification
+            # will trigger the *next* Lambda. The below is for *direct* invocation.
+            # However, for true asynchronous workflow, let Textract's completion trigger the next step.
+
+            # For simplicity in this example, we'll assume a direct, but conceptual, invocation
+            # of the next Lambda which might be triggered by Textract's completion notification.
+            # For a truly robust async flow, the next Lambda would be triggered by an SNS Topic
+            # that Textract publishes to, and that SNS topic would trigger the next Lambda.
+            # This example demonstrates starting the Textract job. The *next* Lambda
+            # would process the *completion* notification from Textract.
+
+            # Example of how to structure the payload for the next Lambda if directly invoked
+            # (less common for Textract async, but good for understanding data flow):
+            # payload_to_analyzer = {
+            #     'jobId': job_id,
+            #     'documentLocation': {
+            #         's3Object': {
+            #             'bucket': bucket_name,
+            #             'name': object_key
+            #         }
+            #     }
+            # }
+            # lambda_client.invoke(
+            #     FunctionName=ANALYZE_LAMBDA_ARN,
+            #     InvocationType='Event', # Asynchronous invocation
+            #     Payload=json.dumps(payload_to_analyzer)
+            # )
+            # logger.info(f"Invoked analyzer lambda with payload for job ID: {job_id}")
+
+        except Exception as e:
+            logger.error(f"Error processing {object_key}: {e}")
+            raise e
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Textract job initiated successfully.')
+    }
+Important Note on s3_to_textract_lambda.py: For true asynchronous processing (which is best for Textract as it can take time), the s3_to_textract_lambda.py only starts the Textract job. Textract then publishes its completion status (and a link to results) to an SNS Topic. Your second Lambda (resume_analyzer_lambda.py) should be subscribed to that SNS Topic.
+________________________________________
+3. Python Lambda Function 2: resume_analyzer_lambda.py
+This Lambda function will be triggered by the SNS notification from Textract upon job completion. It retrieves the Textract results, parses the resume content, applies custom logic for scoring, stores the data, and sends notifications.
+Python
+import os
+import boto3
+import json
+import logging
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+textract = boto3.client('textract')
+dynamodb = boto3.resource('dynamodb')
+sns = boto3.client('sns')
+
+DYNAMODB_TABLE_NAME = os.environ.get('DYNAMODB_TABLE_NAME')
+SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN')
+
+# Sample job description criteria (can be fetched from DynamoDB or config)
+JOB_CRITERIA = {
+    "required_skills": ["Python", "AWS Lambda", "DynamoDB", "Textract", "API Gateway"],
+    "preferred_skills": ["Kubernetes", "Docker", "Machine Learning", "CI/CD"],
+    "keywords": ["senior", "lead", "architect", "engineer", "developer", "experience", "years"],
+    "education_levels": ["B.Tech", "M.Tech", "Ph.D", "Master's", "Bachelor's"]
+}
+
+def extract_text_from_textract_response(textract_result_pages):
+    full_text = []
+    # Iterate through pages and blocks to reconstruct text
+    for page in textract_result_pages:
+        for block in page['Blocks']:
+            if block['BlockType'] == 'LINE':
+                full_text.append(block['Text'])
+    return "\n".join(full_text)
+
+def analyze_resume_content(resume_text):
+    # Normalize text for easier matching
+    normalized_text = resume_text.lower()
+
+    # --- Basic Skill Matching (enhance with more sophisticated NLP/ML) ---
+    matched_required_skills = [
+        skill for skill in JOB_CRITERIA['required_skills'] if skill.lower() in normalized_text
+    ]
+    matched_preferred_skills = [
+        skill for skill in JOB_CRITERIA['preferred_skills'] if skill.lower() in normalized_text
+    ]
+    matched_keywords = [
+        keyword for keyword in JOB_CRITERIA['keywords'] if keyword.lower() in normalized_text
+    ]
+
+    # --- Simple Scoring Logic ---
+    score = 0
+    score += len(matched_required_skills) * 5 # High weight for required skills
+    score += len(matched_preferred_skills) * 2 # Medium weight for preferred skills
+    score += len(matched_keywords) * 1 # Lower weight for general keywords
+
+    # You can add more sophisticated logic here for:
+    # - Experience years extraction (e.g., regex, NLP)
+    # - Education level recognition
+    # - Contact info extraction (regex for email, phone)
+    # - Parsing sections (experience, education, projects) using forms/tables from Textract
+
+    return {
+        "score": score,
+        "matched_required_skills": matched_required_skills,
+        "matched_preferred_skills": matched_preferred_skills,
+        "extracted_text": resume_text[:1000] # Store a snippet or full text if desired
+        # Add more extracted fields here (e.g., 'email', 'phone', 'name')
+    }
+
+def lambda_handler(event, context):
+    logger.info(f"Received Textract completion event: {json.dumps(event)}")
+
+    # Parse the SNS message from Textract
+    message = json.loads(event['Records'][0]['Sns']['Message'])
+    job_status = message['Status']
+    job_id = message['JobId']
+    document_location = message['DocumentLocation']['S3Object']
+    bucket_name = document_location['Bucket']
+    object_key = document_location['Name']
+
+    if job_status != 'SUCCEEDED':
+        logger.error(f"Textract job {job_id} failed with status: {job_status}")
+        return {
+            'statusCode': 400,
+            'body': json.dumps(f"Textract job {job_id} failed.")
+        }
+
+    logger.info(f"Textract job {job_id} SUCCEEDED. Retrieving results for s3://{bucket_name}/{object_key}")
+
+    # Retrieve Textract results
+    full_textract_result = []
+    next_token = None
+    while True:
+        if next_token:
+            response = textract.get_document_analysis(JobId=job_id, NextToken=next_token)
+        else:
+            response = textract.get_document_analysis(JobId=job_id) # Or get_document_text_detection
+        
+        full_textract_result.append(response)
+        if 'NextToken' not in response:
+            break
+        next_token = response['NextToken']
+
+    # Extract all text from Textract results
+    resume_text = extract_text_from_textract_response(full_textract_result)
+    logger.info(f"Extracted text from resume: {resume_text[:500]}...") # Log first 500 chars
+
+    # Analyze the extracted content
+    analysis_results = analyze_resume_content(resume_text)
+    
+    # Prepare data for DynamoDB
+    item_id = object_key.replace('/', '__') # Simple way to make S3 key a valid DDB ID
+    resume_data = {
+        "resumeId": item_id,
+        "s3Bucket": bucket_name,
+        "s3Key": object_key,
+        "jobId": job_id,
+        "analysisDate": str(context.invoked_function_arn.split(":")[-1]), # timestamp, or current time
+        **analysis_results # Unpack analysis results
+    }
+
+    # Store in DynamoDB
+    table = dynamodb.Table(DYNAMODB_TABLE_NAME)
+    try:
+        table.put_item(Item=resume_data)
+        logger.info(f"Stored resume data for {object_key} in DynamoDB.")
+    except Exception as e:
+        logger.error(f"Error storing data to DynamoDB: {e}")
+        # Consider DLQ or retry mechanisms here
+        raise e
+
+    # Send SNS Notification
+    notification_message = {
+        "subject": f"Resume Processed: {object_key}",
+        "body": f"Resume '{object_key}' has been processed. Score: {analysis_results['score']}\n"
+                f"Required Skills Matched: {', '.join(analysis_results['matched_required_skills'])}\n"
+                f"Preferred Skills Matched: {', '.join(analysis_results['matched_preferred_skills'])}\n"
+                f"Review in dashboard (if applicable): YOUR_DASHBOARD_URL_HERE"
+    }
+    
+    try:
+        sns.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject=notification_message['subject'],
+            Message=notification_message['body']
+        )
+        logger.info(f"SNS notification sent for {object_key}.")
+    except Exception as e:
+        logger.error(f"Error sending SNS notification: {e}")
+        # Still return success if DDB write was okay, or handle as critical failure
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Resume processed, analyzed, stored, and notified.')
+    }
+
+Important Considerations for resume_analyzer_lambda.py:
+•	Textract Result Handling: get_document_analysis returns results in pages. You need to iterate and combine them. For complex parsing (forms, tables), you'd need more sophisticated logic to extract specific fields.
+•	Resume Parsing Logic: The analyze_resume_content function is very basic. For a real-world application, you would need: 
+o	More advanced regex to extract emails, phone numbers, names, and specific date ranges for experience.
+o	NLP libraries (e.g., spaCy, NLTK) or integration with AWS Comprehend/Comprehend Medical for entity recognition, keyphrase extraction, and more nuanced understanding.
+o	Logic to handle different resume formats and structures.
+•	Job Description Integration: Ideally, the JOB_CRITERIA would come from a database or a separate configuration mechanism, allowing HR to define criteria dynamically.
+•	Error Handling: Implement robust try-except blocks and potentially dead-letter queues (DLQs) for Lambda.
+•	Scalability: For high volumes, ensure DynamoDB throughput is sufficient or use PAY_PER_REQUEST.
+•	Security: Always follow the principle of least privilege for IAM roles.
+________________________________________
+Deployment Steps (Conceptual):
+1.	Create S3 Bucket: For your Lambda deployment packages (e.g., your-code-deploy-bucket).
+2.	Package Lambda Code: 
+o	For s3_to_textract_lambda.py: 
+Bash
+zip -r s3_to_textract_lambda.zip s3_to_textract_lambda.py
+aws s3 cp s3_to_textract_lambda.zip s3://your-code-deploy-bucket/
+o	For resume_analyzer_lambda.py: If you add external Python libraries (like requests or spacy), you'll need to package them with your Lambda. 
+Bash
+# Example for dependencies
+mkdir package
+pip install --target package boto3 # boto3 is usually built-in, but example
+pip install --target package spacy # if you use NLP
+cd package
+zip -r9 ../resume_analyzer_lambda.zip .
+cd ..
+zip -g resume_analyzer_lambda.zip resume_analyzer_lambda.py
+aws s3 cp resume_analyzer_lambda.zip s3://your-code-deploy-bucket/
+3.	Create IAM Roles: Manually via console or using the CloudFormation outline provided. Ensure correct permissions.
+4.	Create SNS Topics: 
+o	One for Textract job status notifications.
+o	One for HR notifications (e.g., HRResumeNotifications).
+5.	Create Textract Service Role: An IAM role that Textract can assume to publish to your Textract status SNS Topic. This is crucial for the asynchronous flow.
+6.	Deploy Lambda Functions: Use the CloudFormation template to deploy all resources, or manually create Lambdas in the console, pointing to your S3 code packages and assigning the correct roles and environment variables.
+7.	Configure S3 Event Notification: Set up the S3 bucket (your-resume-upload-bucket) to trigger S3ToTextractLambda on s3:ObjectCreated:* events.
+8.	Subscribe ResumeAnalyzerLambda to Textract SNS Topic: Ensure the Textract job status SNS topic triggers the ResumeAnalyzerLambda.
+This comprehensive breakdown should provide a solid starting point for building your AI-Powered Resume Screener!
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Part 1: Infrastructure as Code (IaC) - Setting Up Your AWS Resources
+This section defines all the AWS services and their configurations. For a real-world deployment, you'd use AWS CloudFormation (YAML) or AWS CDK (Python/TypeScript). This conceptual outline gives you the blueprint for what needs to be created.
+
+
+# -------------------------------------------------------------------
+# Part 1: Infrastructure as Code (IaC) - Conceptual CloudFormation/CDK
+# This section defines the AWS resources for the resume screener.
+# You'd use AWS CloudFormation (YAML) or AWS CDK (Python/TypeScript)
+# to deploy these resources.
+# -------------------------------------------------------------------
+Resources:
+  # S3 Bucket for Resume Uploads
+  ResumeUploadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: your-unique-resume-upload-bucket-name # IMPORTANT: Must be globally unique!
+      Tags:
+        - Key: Project
+          Value: ResumeScreener
+
+  # DynamoDB Table for Storing Processed Resume Data
+  ProcessedResumesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ProcessedResumesData
+      AttributeDefinitions:
+        - AttributeName: resumeId
+          AttributeType: S # String type for the partition key
+      KeySchema:
+        - AttributeName: resumeId
+          KeyType: HASH # Partition key
+      BillingMode: PAY_PER_REQUEST # Cost-effective for varying workloads
+      Tags:
+        - Key: Project
+          Value: ResumeScreener
+
+  # SNS Topic for HR Notifications (e.g., email alerts)
+  HRAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: HRResumeNotificationsTopic
+      DisplayName: HR Resume Alerts
+      Tags:
+        - Key: Project
+          Value: ResumeScreener
+    # After deployment, you'll subscribe an email address to this topic
+
+  # SNS Topic for Textract Job Status Notifications
+  # Textract will publish job completion messages to this topic.
+  TextractStatusTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: TextractJobStatusTopic
+      DisplayName: Textract Job Status
+      Tags:
+        - Key: Project
+          Value: ResumeScreener
+
+  # IAM Role for Textract to Publish to SNS (Crucial for asynchronous flow)
+  TextractSNSPublishRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: textract.amazonaws.com } # Textract service principal
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TextractSNSAllowPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref TextractStatusTopic.Arn # Allow publishing to the Textract status topic
+      Tags:
+        - Key: Project
+          Value: ResumeScreener
+
+  # IAM Role for Lambda Function 1 (S3 Trigger -> Textract Job Starter)
+  S3ToTextractLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole # Allows logging to CloudWatch
+      Policies:
+        - PolicyName: S3TextractStartPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject # To read the uploaded resume from S3
+                Resource: !Sub "${ResumeUploadsBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - textract:StartDocumentAnalysis
+                  - textract:StartDocumentTextDetection # To initiate Textract job
+                Resource: '*' # Textract APIs are global; resource is '*'
+              - Effect: Allow
+                Action: iam:PassRole # To allow Textract to assume TextractSNSPublishRole
+                Resource: !GetAtt TextractSNSPublishRole.Arn
+      Tags:
+        - Key: Project
+          Value: ResumeScreener
+
+  # IAM Role for Lambda Function 2 (Textract Result -> Analyze -> Store/Notify)
+  ResumeAnalyzerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ResumeAnalyzerPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - textract:GetDocumentAnalysis
+                  - textract:GetDocumentTextDetection # To get Textract results
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem # To write analyzed data to DynamoDB
+                Resource: !GetAtt ProcessedResumesTable.Arn
+              - Effect: Allow
+                Action: sns:Publish # To publish notifications to HR
+                Resource: !Ref HRAlertsTopic.Arn
+      Tags:
+        - Key: Project
+          Value: ResumeScreener
+
+  # Lambda Function 1: Triggered by S3 upload, starts Textract analysis
+  S3ToTextractLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: S3ToTextractProcessor
+      Handler: lambda_function.lambda_handler # Assumes your code file is lambda_function.py
+      Runtime: python3.9
+      Role: !GetAtt S3ToTextractLambdaRole.Arn
+      Timeout: 60 # Seconds
+      Environment:
+        Variables:
+          TEXTRACT_STATUS_TOPIC_ARN: !Ref TextractStatusTopic.Arn
+          TEXTRACT_SERVICE_ROLE_ARN: !GetAtt TextractSNSPublishRole.Arn
+      Code:
+        # You'll upload your s3_to_textract_lambda.zip to an S3 bucket first
+        # This is typically managed by your deployment tool (e.g., SAM CLI, CDK)
+        S3Bucket: your-lambda-code-deployment-bucket # Replace with your S3 bucket for Lambda code
+        S3Key: s3_to_textract_lambda.zip
+      Tags:
+        - Key: Project
+          Value: ResumeScreener
+
+  # Lambda Function 2: Triggered by Textract status SNS, processes results
+  ResumeAnalyzerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ResumeDataAnalyzer
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt ResumeAnalyzerLambdaRole.Arn
+      Timeout: 300 # Longer timeout for potentially large files
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME: !Ref ProcessedResumesTable
+          HR_SNS_TOPIC_ARN: !Ref HRAlertsTopic.Arn
+      Code:
+        S3Bucket: your-lambda-code-deployment-bucket # Replace with your S3 bucket for Lambda code
+        S3Key: resume_analyzer_lambda.zip
+      Tags:
+        - Key: Project
+          Value: ResumeScreener
+
+  # S3 Event Notification to trigger the first Lambda
+  S3BucketTriggerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt S3ToTextractLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt ResumeUploadsBucket.Arn
+      SourceAccount: !Ref "AWS::AccountId" # Use !Ref "AWS::AccountId" for the current account
+
+  S3BucketNotificationConfig:
+    Type: AWS::S3::BucketNotificationConfiguration
+    Properties:
+      Bucket: !Ref ResumeUploadsBucket
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt S3ToTextractLambda.Arn # Trigger Lambda on any object creation
+            Filter: # Optional: Only trigger for specific file types
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .pdf
+                  - Name: suffix
+                    Value: .docx
+                  - Name: suffix
+                    Value: .jpeg
+                  - Name: suffix
+                    Value: .png
+
+  # SNS Subscription for ResumeAnalyzerLambda to Textract Status Topic
+  TextractStatusSNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      Endpoint: !GetAtt ResumeAnalyzerLambda.Arn
+      TopicArn: !Ref TextractStatusTopic.Arn
+
+  # Permission for SNS Topic to invoke ResumeAnalyzerLambda
+  SNSToLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ResumeAnalyzerLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref TextractStatusTopic.Arn
+      SourceAccount: !Ref "AWS::AccountId"
+
+
+
+
+
+Part 2: Lambda Function 1 - S3 Trigger to Textract Job Starter
+This Python code will be deployed as your first Lambda function. It's automatically triggered when a resume file is uploaded to your S3 bucket. Its sole purpose is to initiate an asynchronous Textract analysis job for that document.
+
+To use this, create a folder named s3_to_textract_lambda and place the following code inside lambda_function.py within that folder:
+
+
+# -------------------------------------------------------------------
+# Part 2: Lambda Function 1 - S3 Trigger to Textract Job Starter
+# File: s3_to_textract_lambda/lambda_function.py
+# -------------------------------------------------------------------
+
+import os
+import boto3
+import json
+import logging
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+textract_client = boto3.client('textract')
+
+# Environment variables are passed from your IaC (CloudFormation/CDK)
+TEXTRACT_STATUS_TOPIC_ARN = os.environ.get('TEXTRACT_STATUS_TOPIC_ARN')
+TEXTRACT_SERVICE_ROLE_ARN = os.environ.get('TEXTRACT_SERVICE_ROLE_ARN')
+
+def lambda_handler(event, context):
+    """
+    Handles S3 object creation events.
+    Starts an asynchronous Textract document analysis job for the uploaded file.
+    """
+    logger.info(f"Received S3 event: {json.dumps(event)}")
+
+    if not event.get('Records'):
+        logger.warning("No records found in S3 event.")
+        return {'statusCode': 200, 'body': 'No records processed.'}
+
+    for record in event['Records']:
+        try:
+            bucket_name = record['s3']['bucket']['name']
+            object_key = record['s3']['object']['key']
+            file_size = record['s3']['object'].get('size', 0)
+            
+            logger.info(f"Processing object: s3://{bucket_name}/{object_key} (Size: {file_size} bytes)")
+
+            # Start asynchronous document analysis with Textract.
+            # 'FORMS' and 'TABLES' features are crucial for structured data extraction from resumes.
+            response = textract_client.start_document_analysis(
+                DocumentLocation={
+                    'S3Object': {
+                        'Bucket': bucket_name,
+                        'Name': object_key
+                    }
+                },
+                Features=['FORMS', 'TABLES'], # Intelligent extraction of key-value pairs and tables
+                NotificationChannel={
+                    'SNSTopicArn': TEXTRACT_STATUS_TOPIC_ARN, # Textract publishes job status here
+                    'RoleArn': TEXTRACT_SERVICE_ROLE_ARN      # IAM role Textract assumes to publish
+                }
+            )
+            job_id = response['JobId']
+            logger.info(f"Textract analysis started for s3://{bucket_name}/{object_key} with JobId: {job_id}")
+
+        except Exception as e:
+            logger.error(f"Error starting Textract job for {object_key}: {e}", exc_info=True)
+            # Re-raise the exception to indicate a failure for this specific S3 event record
+            raise e
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Textract analysis jobs initiated successfully.')
+    }
+
+
+
+Part 3: Lambda Function 2 - Textract Result Analyzer & Notifier
+This is the core logic. This Lambda function is triggered by the SNS notification that Textract publishes when its analysis job is complete. It then retrieves the detailed Textract results, performs resume parsing and scoring based on your defined criteria, stores the valuable data in DynamoDB, and finally sends an HR notification.
+
+To use this, create a folder named resume_analyzer_lambda and place the following code inside lambda_function.py within that folder:
+
+
+
+# -------------------------------------------------------------------
+# Part 3: Lambda Function 2 - Textract Result Analyzer & Notifier
+# File: resume_analyzer_lambda/lambda_function.py
+# -------------------------------------------------------------------
+
+import os
+import boto3
+import json
+import logging
+from datetime import datetime
+import re # For regular expressions, useful for contact info extraction
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+textract_client = boto3.client('textract')
+dynamodb_resource = boto3.resource('dynamodb')
+sns_client = boto3.client('sns')
+
+# Environment variables from your IaC (CloudFormation/CDK)
+DYNAMODB_TABLE_NAME = os.environ.get('DYNAMODB_TABLE_NAME')
+HR_SNS_TOPIC_ARN = os.environ.get('HR_SNS_TOPIC_ARN')
+
+# --- CONFIGURATION: Job Description Criteria ---
+# IMPORTANT: For a production system, fetch this dynamically from a database
+# (like DynamoDB), a configuration store (e.g., AWS AppConfig), or a job API.
+JOB_CRITERIA = {
+    "required_skills": ["Python", "AWS Lambda", "DynamoDB", "Textract", "API Gateway", "CloudFormation", "DevOps"],
+    "preferred_skills": ["Kubernetes", "Docker", "Machine Learning", "Generative AI", "FinOps", "Data Pipelines"],
+    "keywords": ["senior", "lead", "architect", "engineer", "developer", "experience", "years", "cloud"],
+    "education_levels": ["B.Tech", "M.Tech", "Ph.D", "Master's", "Bachelor's"],
+    "years_experience_minimum": 3 # Example: Minimum years of experience for a baseline score
+}
+
+def get_textract_results(job_id):
+    """
+    Retrieves all pages of results for an asynchronous Textract job.
+    Textract results can be paginated, so we loop to get all blocks.
+    """
+    full_textract_result_pages = []
+    next_token = None
+    while True:
+        if next_token:
+            response = textract_client.get_document_analysis(JobId=job_id, NextToken=next_token)
+        else:
+            response = textract_client.get_document_analysis(JobId=job_id)
+
+        full_textract_result_pages.append(response)
+        if 'NextToken' not in response:
+            break
+        next_token = response['NextToken']
+    return full_textract_result_pages
+
+def extract_and_parse_resume(textract_results):
+    """
+    Extracts structured text from Textract analysis results and attempts
+    to pull out key contact information.
+    """
+    full_text_lines = []
+    contact_info = {
+        "name": "N/A", # Will try to extract
+        "email": "N/A",
+        "phone": "N/A"
+    }
+    
+    # Basic regex for common patterns (can be greatly expanded for robustness)
+    email_regex = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+    # This phone regex handles various formats, but may need tuning for specific regions
+    phone_regex = r'(\+\d{1,3}[\s-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?:\s*(?:x|ext)\s*\d+)?'
+    
+    # Textract provides blocks of different types (PAGE, LINE, WORD, FORM, TABLE)
+    # We iterate through lines to get the full text and perform simple regex matching.
+    
+    # Keep track of words on the first page to try and guess the name
+    first_page_words = []
+
+    for page_idx, page in enumerate(textract_results):
+        for block in page['Blocks']:
+            if block['BlockType'] == 'LINE' and 'Text' in block:
+                line_text = block['Text']
+                full_text_lines.append(line_text)
+
+                # Attempt to extract contact info from each line
+                if contact_info["email"] == "N/A":
+                    email_match = re.search(email_regex, line_text)
+                    if email_match:
+                        contact_info["email"] = email_match.group(0)
+                
+                if contact_info["phone"] == "N/A":
+                    phone_match = re.search(phone_regex, line_text)
+                    if phone_match:
+                        contact_info["phone"] = phone_match.group(0)
+            
+            # For name, we might look at the first few lines/words of the first page
+            # This is a heuristic and can be brittle. Textract's forms/entities can be better.
+            if page_idx == 0 and block['BlockType'] == 'WORD' and 'Text' in block:
+                first_page_words.append(block['Text'])
+                # A very basic name guess: first few words if email/phone not found yet
+                if len(first_page_words) < 5 and (contact_info["email"] == "N/A" and contact_info["phone"] == "N/A"):
+                    # Assuming name is prominent at the top and might not look like email/phone
+                    # Further logic here for name extraction
+                    pass
+        # After processing all blocks on the first page, try to guess name from first_page_words
+        if page_idx == 0 and contact_info["name"] == "N/A" and first_page_words:
+            # Simple heuristic: often the first 2-4 words on a resume are the name
+            # Exclude common titles if you have a list (e.g., Mr., Ms., Dr., Jr., III)
+            potential_name = " ".join(first_page_words[:3]).strip() # Take first 3 words
+            if len(potential_name) > 3 and not re.search(r'\d', potential_name): # Basic check for numbers
+                contact_info["name"] = potential_name
+
+
+    return {
+        "raw_text": "\n".join(full_text_lines),
+        "contact_info": contact_info
+    }
+
+def score_resume(resume_data, job_criteria):
+    """
+    Scores the resume based on predefined job criteria.
+    This is a basic scoring mechanism; for higher accuracy, integrate with NLP models
+    or more sophisticated rule engines.
+    """
+    score = 0
+    analysis_details = {
+        "matched_required_skills": [],
+        "matched_preferred_skills": [],
+        "matched_keywords": [],
+        "estimated_experience_years": 0 # Placeholder for extracted experience
+    }
+
+    normalized_text = resume_data['raw_text'].lower()
+
+    # Score for required skills
+    for skill in job_criteria['required_skills']:
+        if skill.lower() in normalized_text:
+            score += 5 # High weight
+            analysis_details['matched_required_skills'].append(skill)
+
+    # Score for preferred skills
+    for skill in job_criteria['preferred_skills']:
+        if skill.lower() in normalized_text:
+            score += 2 # Medium weight
+            analysis_details['matched_preferred_skills'].append(skill)
+
+    # Score for general keywords
+    for keyword in job_criteria['keywords']:
+        if keyword.lower() in normalized_text:
+            score += 1 # Low weight
+            analysis_details['matched_keywords'].append(keyword)
+
+    # --- Attempt to estimate experience years ---
+    # This is a very basic regex and might need refinement for various resume formats.
+    # Looks for phrases like "X years of experience" or "X+ years"
+    experience_matches = re.findall(r'(\d+)\s*(?:\+|years?)\s+of\s+experience|\d+\s*yrs|\d+\s*year(?:s)?', normalized_text)
+    if experience_matches:
+        # Extract all numbers from matches and find the maximum (common for total experience)
+        all_numbers = []
+        for match in experience_matches:
+            # Handle cases where match is a tuple or string (e.g., from different regex groups)
+            if isinstance(match, tuple):
+                for item in match:
+                    if item.isdigit():
+                        all_numbers.append(int(item))
+            elif isinstance(match, str) and match.isdigit():
+                all_numbers.append(int(match))
+            
+        if all_numbers:
+            estimated_exp = max(all_numbers)
+            analysis_details['estimated_experience_years'] = estimated_exp
+            # Bonus for meeting or exceeding minimum experience
+            if job_criteria.get("years_experience_minimum") and estimated_exp >= job_criteria['years_experience_minimum']:
+                score += 10 
+                logger.info(f"Resume meets/exceeds experience criteria: {estimated_exp} years.")
+
+    return score, analysis_details
+
+def lambda_handler(event, context):
+    """
+    Handles Textract job completion notifications via SNS.
+    Retrieves results, analyzes resume, stores data, and sends HR notification.
+    """
+    logger.info(f"Received Textract completion event: {json.dumps(event)}")
+
+    # Parse the SNS message from Textract. The actual message content is in event['Records'][0]['Sns']['Message']
+    sns_message_raw = event['Records'][0]['Sns']['Message']
+    sns_message = json.loads(sns_message_raw)
+    
+    job_status = sns_message.get('Status')
+    job_id = sns_message.get('JobId')
+    document_location = sns_message.get('DocumentLocation', {}).get('S3Object', {})
+    
+    bucket_name = document_location.get('Bucket')
+    object_key = document_location.get('Name')
+
+    if job_status != 'SUCCEEDED':
+        error_message = (f"Textract job {job_id} for s3://{bucket_name}/{object_key} "
+                         f"failed or completed with status: {job_status}. Message: {sns_message_raw}")
+        logger.error(error_message)
+        # Send a failure notification to HR for critical awareness
+        sns_client.publish(
+            TopicArn=HR_SNS_TOPIC_ARN,
+            Subject=f"Resume Processing Failed: {object_key} (Status: {job_status})",
+            Message=error_message
+        )
+        return {'statusCode': 400, 'body': error_message}
+
+    logger.info(f"Textract job {job_id} SUCCEEDED. Retrieving results for s3://{bucket_name}/{object_key}")
+
+    try:
+        # 1. Get Textract Results
+        textract_results = get_textract_results(job_id)
+        
+        # 2. Extract and Parse Resume Content
+        parsed_resume_data = extract_and_parse_resume(textract_results)
+        resume_text = parsed_resume_data['raw_text']
+        contact_info = parsed_resume_data['contact_info']
+
+        logger.info(f"Extracted text from resume: {resume_text[:500]}...") # Log first 500 characters
+
+        # 3. Analyze and Score Resume
+        compatibility_score, analysis_details = score_resume(parsed_resume_data, JOB_CRITERIA)
+        logger.info(f"Resume {object_key} scored: {compatibility_score}, Details: {analysis_details}")
+
+        # 4. Prepare Data for DynamoDB Storage
+        table = dynamodb_resource.Table(DYNAMODB_TABLE_NAME)
+        
+        # Create a unique ID for DynamoDB item, e.g., by combining S3 key and a timestamp
+        # Ensure it's safe for DDB partition key (max 2048 bytes for string)
+        resume_db_id = f"{object_key.replace('/', '___')}-{datetime.utcnow().timestamp()}"
+        if len(resume_db_id) > 2048:
+            resume_db_id = resume_db_id[:2048] # Truncate if too long
+
+        item_to_store = {
+            "resumeId": resume_db_id, # Unique identifier for the resume
+            "s3Bucket": bucket_name,
+            "s3Key": object_key,
+            "textractJobId": job_id,
+            "processingTimestamp": datetime.utcnow().isoformat(),
+            "compatibilityScore": compatibility_score,
+            "extractedEmail": contact_info.get("email", "N/A"),
+            "extractedPhone": contact_info.get("phone", "N/A"),
+            "extractedName": contact_info.get("name", "N/A"),
+            "matchedRequiredSkills": analysis_details['matched_required_skills'],
+            "matchedPreferredSkills": analysis_details['matched_preferred_skills'],
+            "matchedKeywords": analysis_details['matched_keywords'],
+            "estimatedExperienceYears": analysis_details['estimated_experience_years'],
+            "rawResumeTextSnippet": resume_text[:5000] # Store a snippet; DynamoDB item size limits apply (~400KB)
+        }
+
+        # 5. Store in DynamoDB
+        table.put_item(Item=item_to_store)
+        logger.info(f"Stored processed resume data for {object_key} in DynamoDB with ID: {resume_db_id}.")
+
+        # 6. Send HR Notification
+        notification_subject = f"New Resume Processed: {object_key} (Score: {compatibility_score})"
+        notification_body = (
+            f"Resume '{object_key}' has been processed and analyzed.\n\n"
+            f"Compatibility Score: {compatibility_score}\n"
+            f"Extracted Name: {contact_info.get('name', 'N/A')}\n"
+            f"Extracted Email: {contact_info.get('email', 'N/A')}\n"
+            f"Extracted Phone: {contact_info.get('phone', 'N/A')}\n"
+            f"Required Skills Matched: {', '.join(analysis_details['matched_required_skills']) if analysis_details['matched_required_skills'] else 'None'}\n"
+            f"Preferred Skills Matched: {', '.join(analysis_details['matched_preferred_skills']) if analysis_details['matched_preferred_skills'] else 'None'}\n"
+            f"Estimated Experience: {analysis_details['estimated_experience_years']} years\n\n"
+            f"Full details stored in DynamoDB Table '{DYNAMODB_TABLE_NAME}' with ID: {resume_db_id}\n"
+            f"View original resume in S3: https://{bucket_name}.s3.amazonaws.com/{object_key}\n" # Note: S3 URL might need adjustment for public access or pre-signed URLs
+            "---"
+        )
+        
+        sns_client.publish(
+            TopicArn=HR_SNS_TOPIC_ARN,
+            Subject=notification_subject,
+            Message=notification_body
+        )
+        logger.info(f"SNS notification sent for {object_key}.")
+
+        return {
+            'statusCode': 200,
+            'body': json.dumps('Resume processed, analyzed, stored, and notified successfully.')
+        }
+
+    except Exception as e:
+        logger.error(f"Error processing Textract job {job_id} for {object_key}: {e}", exc_info=True)
+        # Send a critical error notification if the processing itself fails
+        sns_client.publish(
+            TopicArn=HR_SNS_TOPIC_ARN,
+            Subject=f"CRITICAL: Resume Analysis Failed for {object_key}",
+            Message=f"An error occurred during analysis: {e}. Please check CloudWatch logs for job ID {job_id}."
+        )
+        raise e # Re-raise to indicate a failure
+
+
+
+
+Part 4: Deployment & Testing Steps (Conceptual)
+These are the high-level steps to get your AI-Powered Resume Screener up and running.
+
+Package Lambda Code:
+
+For s3_to_textract_lambda: Navigate to the s3_to_textract_lambda folder and create a zip archive of its contents.
+
+
+cd s3_to_textract_lambda
+zip -r ../s3_to_textract_lambda.zip .
+cd ..
+
+
+For resume_analyzer_lambda: Navigate to the resume_analyzer_lambda folder and create a zip archive. If you plan to add external Python libraries (like spacy for more advanced NLP), you'll need to install them into a package directory within your Lambda's deployment package.
+
+# If you add external libraries, first install them into a 'package' directory:
+# mkdir package
+# pip install --target package spacy # Example: if you use spacy
+# cd package
+# zip -r9 ../resume_analyzer_lambda.zip .
+# cd ..
+# zip -g resume_analyzer_lambda.zip resume_analyzer_lambda/lambda_function.py
+
+# For this example (without external libraries apart from boto3 which is built-in):
+cd resume_analyzer_lambda
+zip -r ../resume_analyzer_lambda.zip .
+cd ..
+
+
+Upload to S3: Upload these .zip files to an S3 bucket (e.g., your-lambda-code-deployment-bucket) that you'll specify in your IaC.
+
+
+aws s3 cp s3_to_textract_lambda.zip s3://your-lambda-code-deployment-bucket/
+aws s3 cp resume_analyzer_lambda.zip s3://your-lambda-code-deployment-bucket/
+
+
+Deploy Infrastructure:
+
+Use your chosen IaC tool (AWS CloudFormation or AWS CDK) to deploy the resources defined in Part 1. This will create your S3 buckets, DynamoDB table, SNS topics, IAM roles, and Lambda functions, along with setting up all the necessary permissions and triggers.
+Remember to replace placeholder names like your-unique-resume-upload-bucket-name and your-lambda-code-deployment-bucket with unique values.
+Subscribe HR Email to SNS Topic:
+
+After deployment, go to the AWS SNS console.
+Find your HRResumeNotificationsTopic.
+Create a subscription to this topic using the "Email" protocol and enter the email address where HR notifications should be sent. Crucially, you must confirm this subscription via the email you receive.
+Test the System:
+
+Upload a sample resume document (PDF, JPG, DOCX, etc.) to your your-unique-resume-upload-bucket-name S3 bucket.
+Monitor the Flow:
+Check AWS CloudWatch Logs for your S3ToTextractProcessor and ResumeDataAnalyzer Lambda functions. Look for successful invocations, logging messages, and any errors.
+Verify that new items, containing the parsed and scored resume data, appear in your ProcessedResumesData DynamoDB table.
+Finally, check your email inbox for notifications from the HR SNS topic, indicating that a resume has been processed and providing a summary.
+
+
+
+Part 5: Adding a Simple Frontend for Resume Uploads
+A web frontend allows users (recruiters, applicants) to easily upload resumes through a browser, making your solution much more user-friendly than direct S3 uploads.
+
+Overview of the Frontend Project:
+We'll build a static website hosted on Amazon S3. The website will have a simple HTML form for file uploads. Instead of directly uploading to S3 from the browser (which requires exposing credentials or CORS complexities), we'll use Amazon API Gateway and a new AWS Lambda function to generate a pre-signed S3 URL. The frontend JavaScript will then securely upload the file directly to S3 using this temporary, authorized URL.
+
+Why it Matters:
+
+User Experience (UX): Provides a simple, intuitive interface for uploading files.
+Security: Avoids embedding AWS credentials in client-side code. Pre-signed URLs grant temporary, limited permissions for direct uploads.
+Scalability: Static website on S3 is highly scalable and cost-effective. API Gateway and Lambda scale automatically.
+Completeness: Transforms your backend solution into a full-fledged application.
+AWS Services Involved:
+
+Amazon S3:
+One bucket for hosting the static website (e.g., your-resume-screener-frontend).
+Your existing your-unique-resume-upload-bucket-name for resume storage.
+Amazon API Gateway: To create a REST endpoint that exposes your Lambda function.
+AWS Lambda: A new function (e.g., GetPresignedUrlLambda) to generate the S3 pre-signed URL.
+IAM: Roles and policies to grant necessary permissions.
+Amazon CloudFront (Optional but Recommended): For secure (HTTPS), low-latency content delivery of your static website globally.
+Conceptual Code Snippets & Logic:
+
+5.1. IaC Updates (Conceptual CloudFormation/CDK)
+
+
+
+# -------------------------------------------------------------------
+# Part 5.1: IaC Updates for Frontend - Conceptual CloudFormation/CDK
+# -------------------------------------------------------------------
+Resources:
+  # S3 Bucket for Static Website Hosting
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: your-resume-screener-frontend # IMPORTANT: Globally unique, typically matches custom domain
+      AccessControl: PublicRead # For static website hosting
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+      Tags:
+        - Key: Project
+          Value: ResumeScreenerFrontend
+
+  # Bucket Policy for Frontend Bucket (Allow public read access)
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: "*" # Allow public access
+            Action:
+              - s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+
+  # IAM Role for Lambda Function to Generate Pre-signed URL
+  GetPresignedUrlLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3PresignPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject # To allow creating pre-signed URLs for putting objects
+                Resource: !Sub "${ResumeUploadsBucket.Arn}/*" # Crucial: allows uploads to your resume bucket
+      Tags:
+        - Key: Project
+          Value: ResumeScreenerFrontend
+
+  # Lambda Function to Generate Pre-signed S3 URL
+  GetPresignedUrlLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetResumeUploadPresignedUrl
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt GetPresignedUrlLambdaRole.Arn
+      Timeout: 10 # Short timeout
+      Environment:
+        Variables:
+          UPLOAD_BUCKET_NAME: !Ref ResumeUploadsBucket # Pass the target bucket name
+      Code:
+        S3Bucket: your-lambda-code-deployment-bucket
+        S3Key: get_presigned_url_lambda.zip
+      Tags:
+        - Key: Project
+          Value: ResumeScreenerFrontend
+
+  # API Gateway REST API
+  ResumeUploadApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ResumeUploadAPI
+      Description: API for getting pre-signed S3 URLs for resume uploads.
+
+  # API Gateway Resource (e.g., /upload)
+  UploadApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ResumeUploadApi
+      ParentId: !GetAtt ResumeUploadApi.RootResourceId
+      PathPart: upload # e.g., /upload
+
+  # API Gateway Method (e.g., POST /upload)
+  UploadApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ResumeUploadApi
+      ResourceId: !Ref UploadApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE # For a public upload API, consider JWT/Cognito for production
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY # Simplifies integration with Lambda
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetPresignedUrlLambda.Arn}/invocations"
+
+  # Permission for API Gateway to invoke Lambda
+  ApiGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt GetPresignedUrlLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ResumeUploadApi}/*/*"
+
+  # API Gateway Deployment
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref ResumeUploadApi
+    DependsOn:
+      - UploadApiMethod # Ensure method is deployed
+
+  # API Gateway Stage
+  ApiGatewayStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: prod
+      RestApiId: !Ref ResumeUploadApi
+      DeploymentId: !Ref ApiGatewayDeployment
+
+
+
+5.2 New Lambda Function: get_presigned_url_lambda/lambda_function.py
+This Lambda function will be invoked by API Gateway. It takes the filename from the request, generates a pre-signed S3 URL for that file in the target bucket, and returns it to the frontend.
+
+Create a folder get_presigned_url_lambda and inside it, lambda_function.py:
+
+
+
+# -------------------------------------------------------------------
+# Part 5.2: Lambda Function to Generate Pre-signed S3 URL
+# File: get_presigned_url_lambda/lambda_function.py
+# -------------------------------------------------------------------
+
+import json
+import boto3
+import os
+import logging
+from datetime import datetime
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+s3_client = boto3.client('s3')
+
+UPLOAD_BUCKET_NAME = os.environ.get('UPLOAD_BUCKET_NAME')
+
+def lambda_handler(event, context):
+    """
+    Generates a pre-signed S3 URL for uploading a file.
+    Expected event body: {"filename": "resume.pdf", "contentType": "application/pdf"}
+    """
+    logger.info(f"Received event: {json.dumps(event)}")
+
+    # API Gateway typically sends POST requests with a body
+    if 'body' not in event:
+        logger.error("Missing 'body' in event.")
+        return {
+            'statusCode': 400,
+            'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+            'body': json.dumps({'message': 'Missing request body.'})
+        }
+
+    try:
+        request_body = json.loads(event['body'])
+        filename = request_body.get('filename')
+        content_type = request_body.get('contentType') # Important for browser uploads
+        
+        if not filename or not content_type:
+            logger.error("Missing 'filename' or 'contentType' in request body.")
+            return {
+                'statusCode': 400,
+                'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+                'body': json.dumps({'message': 'Missing filename or content type.'})
+            }
+
+        # Ensure the filename is unique to prevent overwrites, e.g., by adding a timestamp
+        unique_filename = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{filename}"
+        
+        # Generate the pre-signed URL for a PUT operation
+        presigned_url = s3_client.generate_presigned_url(
+            ClientMethod='put_object',
+            Params={
+                'Bucket': UPLOAD_BUCKET_NAME,
+                'Key': unique_filename,
+                'ContentType': content_type # Important for browser to set correct header
+            },
+            ExpiresIn=300 # URL valid for 5 minutes
+        )
+        logger.info(f"Generated pre-signed URL for {unique_filename}")
+
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*' # IMPORTANT: Enable CORS for your frontend domain
+            },
+            'body': json.dumps({
+                'uploadUrl': presigned_url,
+                'fileKey': unique_filename # Return the key to the client for tracking
+            })
+        }
+
+    except json.JSONDecodeError:
+        logger.error("Invalid JSON in request body.")
+        return {
+            'statusCode': 400,
+            'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+            'body': json.dumps({'message': 'Invalid JSON in request body.'})
+        }
+    except Exception as e:
+        logger.error(f"Error generating pre-signed URL: {e}", exc_info=True)
+        return {
+            'statusCode': 500,
+            'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+            'body': json.dumps({'message': f'Internal server error: {str(e)}'})
+        }
+
+
+
+
+5.3. Frontend HTML/JavaScript (index.html)
+This static HTML file will be hosted in your your-resume-screener-frontend S3 bucket.
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Resume Screener Upload</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f4f4f4; }
+        .container { background-color: #fff; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); max-width: 600px; margin: auto; }
+        h1 { color: #333; text-align: center; margin-bottom: 30px; }
+        .upload-area { border: 2px dashed #ccc; padding: 40px; text-align: center; cursor: pointer; border-radius: 8px; }
+        .upload-area:hover { border-color: #007bff; }
+        input[type="file"] { display: none; }
+        button { background-color: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; margin-top: 20px; }
+        button:hover { background-color: #0056b3; }
+        #status-message { margin-top: 20px; padding: 10px; border-radius: 5px; background-color: #e2e3e5; color: #333; display: none; }
+        .success { background-color: #d4edda; color: #155724; }
+        .error { background-color: #f8d7da; color: #721c24; }
+        #file-name { margin-top: 10px; font-style: italic; color: #555; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Upload Your Resume</h1>
+        <div class="upload-area" id="drop-area">
+            <input type="file" id="fileInput" accept=".pdf,.doc,.docx,.jpg,.jpeg,.png">
+            <p>Drag & drop your resume here, or click to select a file.</p>
+            <p id="file-name"></p>
+        </div>
+        <button id="uploadButton" disabled>Upload Resume</button>
+        <div id="status-message"></div>
+    </div>
+
+    <script>
+        // IMPORTANT: Replace with your actual API Gateway endpoint
+        const API_GATEWAY_ENDPOINT = "YOUR_API_GATEWAY_INVOKE_URL/prod/upload"; 
+        // Example: https://xxxxxxxxxx.execute-api.us-east-1.amazonaws.com/prod/upload
+
+        const fileInput = document.getElementById('fileInput');
+        const dropArea = document.getElementById('drop-area');
+        const uploadButton = document.getElementById('uploadButton');
+        const statusMessage = document.getElementById('status-message');
+        const fileNameDisplay = document.getElementById('file-name');
+
+        let selectedFile = null;
+
+        function showStatus(message, isError = false) {
+            statusMessage.textContent = message;
+            statusMessage.className = isError ? 'error' : 'success';
+            statusMessage.style.display = 'block';
+        }
+
+        function resetState() {
+            selectedFile = null;
+            fileNameDisplay.textContent = '';
+            uploadButton.disabled = true;
+            statusMessage.style.display = 'none';
+            statusMessage.className = '';
+        }
+
+        // Handle file selection via click
+        dropArea.addEventListener('click', () => fileInput.click());
+
+        // Handle file input change
+        fileInput.addEventListener('change', (event) => {
+            selectedFile = event.target.files[0];
+            if (selectedFile) {
+                fileNameDisplay.textContent = `Selected: ${selectedFile.name} (${(selectedFile.size / 1024).toFixed(2)} KB)`;
+                uploadButton.disabled = false;
+                statusMessage.style.display = 'none'; // Clear previous status
+            } else {
+                resetState();
+            }
+        });
+
+        // Handle drag and drop
+        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+            dropArea.addEventListener(eventName, preventDefaults, false);
+        });
+
+        function preventDefaults(e) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+
+        ['dragenter', 'dragover'].forEach(eventName => {
+            dropArea.addEventListener(eventName, () => dropArea.classList.add('highlight'), false);
+        });
+
+        ['dragleave', 'drop'].forEach(eventName => {
+            dropArea.addEventListener(eventName, () => dropArea.classList.remove('highlight'), false);
+        });
+
+        dropArea.addEventListener('drop', (e) => {
+            const dt = e.dataTransfer;
+            selectedFile = dt.files[0];
+            if (selectedFile) {
+                fileNameDisplay.textContent = `Selected: ${selectedFile.name} (${(selectedFile.size / 1024).toFixed(2)} KB)`;
+                uploadButton.disabled = false;
+                statusMessage.style.display = 'none'; // Clear previous status
+            } else {
+                resetState();
+            }
+        }, false);
+
+
+        // Handle upload button click
+        uploadButton.addEventListener('click', async () => {
+            if (!selectedFile) {
+                showStatus('Please select a file first.', true);
+                return;
+            }
+
+            uploadButton.disabled = true;
+            showStatus('Preparing for upload...', false);
+
+            try {
+                // 1. Get pre-signed URL from API Gateway
+                const response = await fetch(API_GATEWAY_ENDPOINT, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        filename: selectedFile.name,
+                        contentType: selectedFile.type || 'application/octet-stream' // Fallback for unknown types
+                    })
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(`Failed to get pre-signed URL: ${errorData.message || response.statusText}`);
+                }
+
+                const { uploadUrl, fileKey } = await response.json();
+                showStatus(`Uploading ${selectedFile.name}...`, false);
+
+                // 2. Upload file directly to S3 using the pre-signed URL
+                const s3UploadResponse = await fetch(uploadUrl, {
+                    method: 'PUT',
+                    headers: {
+                        'Content-Type': selectedFile.type || 'application/octet-stream'
+                    },
+                    body: selectedFile
+                });
+
+                if (!s3UploadResponse.ok) {
+                    throw new Error(`Failed to upload to S3: ${s3UploadResponse.statusText}`);
+                }
+
+                showStatus(`Resume "${selectedFile.name}" uploaded successfully! Processing will begin shortly.`, false);
+                resetState();
+
+            } catch (error) {
+                console.error('Upload error:', error);
+                showStatus(`Upload failed: ${error.message}. Please try again.`, true);
+                uploadButton.disabled = false; // Re-enable button on error
+            }
+        });
+    </script>
+</body>
+</html>
+
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Resume Screener Upload</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f4f4f4; }
+        .container { background-color: #fff; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); max-width: 600px; margin: auto; }
+        h1 { color: #333; text-align: center; margin-bottom: 30px; }
+        .upload-area { border: 2px dashed #ccc; padding: 40px; text-align: center; cursor: pointer; border-radius: 8px; }
+        .upload-area:hover { border-color: #007bff; }
+        input[type="file"] { display: none; }
+        button { background-color: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; margin-top: 20px; }
+        button:hover { background-color: #0056b3; }
+        #status-message { margin-top: 20px; padding: 10px; border-radius: 5px; background-color: #e2e3e5; color: #333; display: none; }
+        .success { background-color: #d4edda; color: #155724; }
+        .error { background-color: #f8d7da; color: #721c24; }
+        #file-name { margin-top: 10px; font-style: italic; color: #555; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Upload Your Resume</h1>
+        <div class="upload-area" id="drop-area">
+            <input type="file" id="fileInput" accept=".pdf,.doc,.docx,.jpg,.jpeg,.png">
+            <p>Drag & drop your resume here, or click to select a file.</p>
+            <p id="file-name"></p>
+        </div>
+        <button id="uploadButton" disabled>Upload Resume</button>
+        <div id="status-message"></div>
+    </div>
+
+    <script>
+        // IMPORTANT: Replace with your actual API Gateway endpoint
+        const API_GATEWAY_ENDPOINT = "YOUR_API_GATEWAY_INVOKE_URL/prod/upload"; 
+        // Example: https://xxxxxxxxxx.execute-api.us-east-1.amazonaws.com/prod/upload
+
+        const fileInput = document.getElementById('fileInput');
+        const dropArea = document.getElementById('drop-area');
+        const uploadButton = document.getElementById('uploadButton');
+        const statusMessage = document.getElementById('status-message');
+        const fileNameDisplay = document.getElementById('file-name');
+
+        let selectedFile = null;
+
+        function showStatus(message, isError = false) {
+            statusMessage.textContent = message;
+            statusMessage.className = isError ? 'error' : 'success';
+            statusMessage.style.display = 'block';
+        }
+
+        function resetState() {
+            selectedFile = null;
+            fileNameDisplay.textContent = '';
+            uploadButton.disabled = true;
+            statusMessage.style.display = 'none';
+            statusMessage.className = '';
+        }
+
+        // Handle file selection via click
+        dropArea.addEventListener('click', () => fileInput.click());
+
+        // Handle file input change
+        fileInput.addEventListener('change', (event) => {
+            selectedFile = event.target.files[0];
+            if (selectedFile) {
+                fileNameDisplay.textContent = `Selected: ${selectedFile.name} (${(selectedFile.size / 1024).toFixed(2)} KB)`;
+                uploadButton.disabled = false;
+                statusMessage.style.display = 'none'; // Clear previous status
+            } else {
+                resetState();
+            }
+        });
+
+        // Handle drag and drop
+        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+            dropArea.addEventListener(eventName, preventDefaults, false);
+        });
+
+        function preventDefaults(e) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+
+        ['dragenter', 'dragover'].forEach(eventName => {
+            dropArea.addEventListener(eventName, () => dropArea.classList.add('highlight'), false);
+        });
+
+        ['dragleave', 'drop'].forEach(eventName => {
+            dropArea.addEventListener(eventName, () => dropArea.classList.remove('highlight'), false);
+        });
+
+        dropArea.addEventListener('drop', (e) => {
+            const dt = e.dataTransfer;
+            selectedFile = dt.files[0];
+            if (selectedFile) {
+                fileNameDisplay.textContent = `Selected: ${selectedFile.name} (${(selectedFile.size / 1024).toFixed(2)} KB)`;
+                uploadButton.disabled = false;
+                statusMessage.style.display = 'none'; // Clear previous status
+            } else {
+                resetState();
+            }
+        }, false);
+
+
+        // Handle upload button click
+        uploadButton.addEventListener('click', async () => {
+            if (!selectedFile) {
+                showStatus('Please select a file first.', true);
+                return;
+            }
+
+            uploadButton.disabled = true;
+            showStatus('Preparing for upload...', false);
+
+            try {
+                // 1. Get pre-signed URL from API Gateway
+                const response = await fetch(API_GATEWAY_ENDPOINT, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        filename: selectedFile.name,
+                        contentType: selectedFile.type || 'application/octet-stream' // Fallback for unknown types
+                    })
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(`Failed to get pre-signed URL: ${errorData.message || response.statusText}`);
+                }
+
+                const { uploadUrl, fileKey } = await response.json();
+                showStatus(`Uploading ${selectedFile.name}...`, false);
+
+                // 2. Upload file directly to S3 using the pre-signed URL
+                const s3UploadResponse = await fetch(uploadUrl, {
+                    method: 'PUT',
+                    headers: {
+                        'Content-Type': selectedFile.type || 'application/octet-stream'
+                    },
+                    body: selectedFile
+                });
+
+                if (!s3UploadResponse.ok) {
+                    throw new Error(`Failed to upload to S3: ${s3UploadResponse.statusText}`);
+                }
+
+                showStatus(`Resume "${selectedFile.name}" uploaded successfully! Processing will begin shortly.`, false);
+                resetState();
+
+            } catch (error) {
+                console.error('Upload error:', error);
+                showStatus(`Upload failed: ${error.message}. Please try again.`, true);
+                uploadButton.disabled = false; // Re-enable button on error
+            }
+        });
+    </script>
+</body>
+</html>
+
+
+
+
+5.4. Deployment Notes for Frontend:
+Package GetPresignedUrlLambda:
+Bash
+
+cd get_presigned_url_lambda
+zip -r ../get_presigned_url_lambda.zip .
+cd ..
+
+
+aws s3 cp get_presigned_url_lambda.zip s3://your-lambda-code-deployment-bucket/
+Deploy IaC: Use CloudFormation/CDK to deploy the updated template from Part 5.1.
+Upload Frontend Files to S3:
+Save the HTML/JS above as index.html.
+Upload index.html (and any error.html or CSS files) to your your-resume-screener-frontend S3 bucket.
+Crucial: After deployment, get the invoke URL of your API Gateway (e.g., https://xxxxxxxxxx.execute-api.us-east-1.amazonaws.com/prod/upload). Update the API_GATEWAY_ENDPOINT variable in index.html with your actual URL.
+Access Frontend: Once uploaded, you can access your frontend via the S3 static website endpoint (e.g., http://your-resume-screener-frontend.s3-website.REGION.amazonaws.com/). For HTTPS and custom domains, configure CloudFront in front of the S3 static website.
+CORS Configuration: Ensure your API Gateway has CORS headers configured (added in the Lambda response in the example, but better done in API Gateway console/IaC). Also, ensure your ResumeUploadsBucket has a CORS policy allowing PUT requests from your frontend domain.
+Part 6: More Advanced NLP for Resume Analysis
+To go beyond simple keyword matching, you need to integrate more sophisticated NLP techniques. This will primarily involve enhancing your resume_analyzer_lambda.py.
+
+Why it Matters:
+
+Deeper Understanding: Moves from surface-level matching to contextual comprehension of skills, experience, and roles.
+Improved Accuracy: Reduces false positives/negatives in screening.
+Rich Insights: Extract specific entities (companies, dates, job titles, specialized skills) for more robust candidate profiles.
+Bias Reduction: More sophisticated models can (if trained carefully) further reduce bias compared to simple keyword lists.
+AWS Services & Technologies:
+
+Amazon Comprehend: AWS's managed NLP service. Excellent for Named Entity Recognition (NER), Keyphrase Extraction, Sentiment Analysis.
+Amazon SageMaker: For building, training, and deploying custom ML models if your needs are highly specialized (e.g., custom skill classification not covered by Comprehend).
+AWS Lambda Layers: To package larger NLP libraries (like spaCy, NLTK, scikit-learn) with your Lambda function without hitting deployment package size limits.
+Python Libraries: spaCy, NLTK, Scikit-learn (for custom logic).
+Integration Point: The extract_and_parse_resume and score_resume functions within your resume_analyzer_lambda/lambda_function.py.
+
+6.1. Enhancing resume_analyzer_lambda/lambda_function.py with Advanced NLP
+We'll focus on demonstrating Amazon Comprehend integration as it's a managed service, simplifying deployment compared to custom SageMaker models.
+
+
+# -------------------------------------------------------------------
+# Part 6.1: Lambda Function 2 - Textract Result Analyzer & Notifier
+#           (Enhanced with Amazon Comprehend)
+# File: resume_analyzer_lambda/lambda_function.py
+# -------------------------------------------------------------------
+
+import os
+import boto3
+import json
+import logging
+from datetime import datetime
+import re
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+textract_client = boto3.client('textract')
+dynamodb_resource = boto3.resource('dynamodb')
+sns_client = boto3.client('sns')
+comprehend_client = boto3.client('comprehend') # Initialize Comprehend client
+
+# Environment variables from your IaC
+DYNAMODB_TABLE_NAME = os.environ.get('DYNAMODB_TABLE_NAME')
+HR_SNS_TOPIC_ARN = os.environ.get('HR_SNS_TOPIC_ARN')
+
+# --- CONFIGURATION: Job Description Criteria ---
+# This remains the same, but the scoring logic will leverage more data.
+JOB_CRITERIA = {
+    "required_skills": ["Python", "AWS Lambda", "DynamoDB", "Textract", "API Gateway", "CloudFormation", "DevOps"],
+    "preferred_skills": ["Kubernetes", "Docker", "Machine Learning", "Generative AI", "FinOps", "Data Pipelines"],
+    "keywords": ["senior", "lead", "architect", "engineer", "developer", "experience", "years", "cloud"],
+    "education_levels": ["B.Tech", "M.Tech", "Ph.D", "Master's", "Bachelor's"],
+    "years_experience_minimum": 3
+}
+
+def get_textract_results(job_id):
+    # ... (Same as before) ...
+    full_textract_result_pages = []
+    next_token = None
+    while True:
+        if next_token:
+            response = textract_client.get_document_analysis(JobId=job_id, NextToken=next_token)
+        else:
+            response = textract_client.get_document_analysis(JobId=job_id)
+
+        full_textract_result_pages.append(response)
+        if 'NextToken' not in response:
+            break
+        next_token = response['NextToken']
+    return full_textract_result_pages
+
+def extract_and_parse_resume(textract_results):
+    """
+    Extracts raw text and basic contact info.
+    More advanced NLP will be done *after* raw text extraction.
+    """
+    full_text_lines = []
+    contact_info = {
+        "name": "N/A",
+        "email": "N/A",
+        "phone": "N/A"
+    }
+    
+    email_regex = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+    phone_regex = r'(\+\d{1,3}[\s-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?:\s*(?:x|ext)\s*\d+)?'
+    
+    first_page_words = []
+
+    for page_idx, page in enumerate(textract_results):
+        for block in page['Blocks']:
+            if block['BlockType'] == 'LINE' and 'Text' in block:
+                line_text = block['Text']
+                full_text_lines.append(line_text)
+
+                if contact_info["email"] == "N/A":
+                    email_match = re.search(email_regex, line_text)
+                    if email_match:
+                        contact_info["email"] = email_match.group(0)
+                
+                if contact_info["phone"] == "N/A":
+                    phone_match = re.search(phone_regex, line_text)
+                    if phone_match:
+                        contact_info["phone"] = phone_match.group(0)
+            
+            if page_idx == 0 and block['BlockType'] == 'WORD' and 'Text' in block:
+                first_page_words.append(block['Text'])
+                if len(first_page_words) < 5 and contact_info["name"] == "N/A": # Basic name guess
+                    potential_name = " ".join(first_page_words[:min(len(first_page_words), 3)]).strip()
+                    if len(potential_name) > 3 and not re.search(r'\d', potential_name) and '@' not in potential_name:
+                        contact_info["name"] = potential_name
+
+    return {
+        "raw_text": "\n".join(full_text_lines),
+        "contact_info": contact_info
+    }
+
+
+def perform_comprehend_analysis(text):
+    """
+    Uses Amazon Comprehend for entity and keyphrase extraction.
+    Note: Comprehend limits input text to 5000 bytes per API call.
+    For longer texts, you'd need to split it into chunks.
+    """
+    # For simplicity, we'll truncate or split if needed,
+    # or process in chunks if the resume text is very long.
+    # Standard Comprehend limits are 5000 characters for sync operations.
+    # For large documents, consider batch operations or async Comprehend jobs.
+    
+    truncated_text = text[:4900] # Stay well within limits, assuming ASCII for byte length
+
+    try:
+        # Detect entities (e.g., PERSON, ORGANIZATION, LOCATION, COMMERCIAL_ITEM)
+        # For resumes, custom entity recognizers in Comprehend Medical or Comprehend Custom
+        # are more powerful for skills, job titles, etc.
+        entities_response = comprehend_client.detect_entities(Text=truncated_text, LanguageCode='en')
+        entities = [ent['Text'] for ent in entities_response['Entities'] if ent['Type'] in ['ORGANIZATION', 'PERSON', 'COMMERCIAL_ITEM', 'TITLE']]
+        
+        # Detect key phrases (important for skills, experience, qualifications)
+        key_phrases_response = comprehend_client.detect_key_phrases(Text=truncated_text, LanguageCode='en')
+        key_phrases = [kp['Text'] for kp in key_phrases_response['KeyPhrases']]
+
+        return {
+            "comprehend_entities": entities,
+            "comprehend_key_phrases": key_phrases
+        }
+    except Exception as e:
+        logger.error(f"Error calling Amazon Comprehend: {e}", exc_info=True)
+        return {
+            "comprehend_entities": [],
+            "comprehend_key_phrases": []
+        }
+
+def score_resume(resume_data, job_criteria, comprehend_analysis):
+    """
+    Scores the resume, now leveraging Comprehend insights.
+    """
+    score = 0
+    analysis_details = {
+        "matched_required_skills": [],
+        "matched_preferred_skills": [],
+        "matched_keywords": [],
+        "extracted_comprehend_entities": comprehend_analysis['comprehend_entities'],
+        "extracted_comprehend_key_phrases": comprehend_analysis['comprehend_key_phrases'],
+        "estimated_experience_years": 0
+    }
+
+    normalized_text = resume_data['raw_text'].lower()
+    
+    # --- Skill Matching (Enhanced) ---
+    # Match against both raw text and Comprehend key phrases/entities
+    all_terms_to_match = set(normalized_text.split() + [kp.lower() for kp in comprehend_analysis['comprehend_key_phrases']] + [ent.lower() for ent in comprehend_analysis['comprehend_entities']])
+
+    for skill in job_criteria['required_skills']:
+        if skill.lower() in all_terms_to_match or any(skill.lower() in phrase for phrase in comprehend_analysis['comprehend_key_phrases']):
+            score += 5
+            analysis_details['matched_required_skills'].append(skill)
+
+    for skill in job_criteria['preferred_skills']:
+        if skill.lower() in all_terms_to_match or any(skill.lower() in phrase for phrase in comprehend_analysis['comprehend_key_phrases']):
+            score += 2
+            analysis_details['matched_preferred_skills'].append(skill)
+
+    for keyword in job_criteria['keywords']:
+        if keyword.lower() in all_terms_to_match:
+            score += 1
+
+    # --- Experience Calculation (Improved with Regex) ---
+    experience_matches = re.findall(r'(\d+)\s*(?:\+|year(?:s)?)\s+of\s+experience|\d+\s*yrs|\d+\s*year(?:s)?', normalized_text)
+    if experience_matches:
+        all_numbers = []
+        for match in experience_matches:
+            if isinstance(match, tuple): # Handle cases where regex returns groups
+                for item in match:
+                    if item.isdigit():
+                        all_numbers.append(int(item))
+            elif isinstance(match, str) and match.isdigit():
+                all_numbers.append(int(match))
+            
+        if all_numbers:
+            estimated_exp = max(all_numbers)
+            analysis_details['estimated_experience_years'] = estimated_exp
+            if job_criteria.get("years_experience_minimum") and estimated_exp >= job_criteria['years_experience_minimum']:
+                score += 10 
+
+    return score, analysis_details
+
+def lambda_handler(event, context):
+    # ... (Error handling and initial parsing of SNS message from Textract - Same as before) ...
+    logger.info(f"Received Textract completion event: {json.dumps(event)}")
+
+    sns_message_raw = event['Records'][0]['Sns']['Message']
+    sns_message = json.loads(sns_message_raw)
+    
+    job_status = sns_message.get('Status')
+    job_id = sns_message.get('JobId')
+    document_location = sns_message.get('DocumentLocation', {}).get('S3Object', {})
+    
+    bucket_name = document_location.get('Bucket')
+    object_key = document_location.get('Name')
+
+    if job_status != 'SUCCEEDED':
+        error_message = (f"Textract job {job_id} for s3://{bucket_name}/{object_key} "
+                         f"failed or completed with status: {job_status}. Message: {sns_message_raw}")
+        logger.error(error_message)
+        sns_client.publish(
+            TopicArn=HR_SNS_TOPIC_ARN,
+            Subject=f"Resume Processing Failed: {object_key} (Status: {job_status})",
+            Message=error_message
+        )
+        return {'statusCode': 400, 'body': error_message}
+
+    logger.info(f"Textract job {job_id} SUCCEEDED. Retrieving results for s3://{bucket_name}/{object_key}")
+
+    try:
+        # 1. Get Textract Results
+        textract_results = get_textract_results(job_id)
+        
+        # 2. Extract and Parse Resume Content
+        parsed_resume_data = extract_and_parse_resume(textract_results)
+        resume_text = parsed_resume_data['raw_text']
+        contact_info = parsed_resume_data['contact_info']
+
+        logger.info(f"Extracted text from resume: {resume_text[:500]}...")
+
+        # --- NEW: Perform Amazon Comprehend Analysis ---
+        comprehend_analysis_results = perform_comprehend_analysis(resume_text)
+        logger.info(f"Comprehend analysis done: Entities={comprehend_analysis_results['comprehend_entities'][:10]}, KeyPhrases={comprehend_analysis_results['comprehend_key_phrases'][:10]}")
+
+        # 3. Analyze and Score Resume (using Comprehend data)
+        compatibility_score, analysis_details = score_resume(parsed_resume_data, JOB_CRITERIA, comprehend_analysis_results)
+        logger.info(f"Resume {object_key} scored: {compatibility_score}, Details: {analysis_details}")
+
+        # 4. Prepare Data for DynamoDB Storage (add Comprehend data)
+        table = dynamodb_resource.Table(DYNAMODB_TABLE_NAME)
+        
+        resume_db_id = f"{object_key.replace('/', '___')}-{datetime.utcnow().timestamp()}"
+        if len(resume_db_id) > 2048:
+            resume_db_id = resume_db_id[:2048]
+
+        item_to_store = {
+            "resumeId": resume_db_id,
+            "s3Bucket": bucket_name,
+            "s3Key": object_key,
+            "textractJobId": job_id,
+            "processingTimestamp": datetime.utcnow().isoformat(),
+            "compatibilityScore": compatibility_score,
+            "extractedName": contact_info.get("name", "N/A"),
+            "extractedEmail": contact_info.get("email", "N/A"),
+            "extractedPhone": contact_info.get("phone", "N/A"),
+            "matchedRequiredSkills": analysis_details['matched_required_skills'],
+            "matchedPreferredSkills": analysis_details['matched_preferred_skills'],
+            "matchedKeywords": analysis_details['matched_keywords'],
+            "estimatedExperienceYears": analysis_details['estimated_experience_years'],
+            "comprehendEntities": analysis_details['extracted_comprehend_entities'], # Store Comprehend entities
+            "comprehendKeyPhrases": analysis_details['extracted_comprehend_key_phrases'], # Store Comprehend key phrases
+            "rawResumeTextSnippet": resume_text[:5000]
+        }
+
+        # 5. Store in DynamoDB
+        table.put_item(Item=item_to_store)
+        logger.info(f"Stored processed resume data for {object_key} in DynamoDB with ID: {resume_db_id}.")
+
+        # 6. Send HR Notification (update message with new insights)
+        notification_subject = f"New Resume Processed: {object_key} (Score: {compatibility_score})"
+        notification_body = (
+            f"Resume '{object_key}' has been processed and analyzed.\n\n"
+            f"Compatibility Score: {compatibility_score}\n"
+            f"Extracted Name: {contact_info.get('name', 'N/A')}\n"
+            f"Extracted Email: {contact_info.get('email', 'N/A')}\n"
+            f"Extracted Phone: {contact_info.get('phone', 'N/A')}\n"
+            f"Required Skills Matched: {', '.join(analysis_details['matched_required_skills']) if analysis_details['matched_required_skills'] else 'None'}\n"
+            f"Preferred Skills Matched: {', '.join(analysis_details['matched_preferred_skills']) if analysis_details['matched_preferred_skills'] else 'None'}\n"
+            f"Estimated Experience: {analysis_details['estimated_experience_years']} years\n\n"
+            f"Key Phrases: {', '.join(analysis_details['extracted_comprehend_key_phrases'][:5])}...\n" # Top 5 key phrases
+            f"Entities: {', '.join(analysis_details['extracted_comprehend_entities'][:5])}...\n\n" # Top 5 entities
+            f"Full details stored in DynamoDB Table '{DYNAMODB_TABLE_NAME}' with ID: {resume_db_id}\n"
+            f"View original resume in S3: https://{bucket_name}.s3.amazonaws.com/{object_key}\n"
+            "---"
+        )
+        
+        sns_client.publish(
+            TopicArn=HR_SNS_TOPIC_ARN,
+            Subject=notification_subject,
+            Message=notification_body
+        )
+        logger.info(f"SNS notification sent for {object_key}.")
+
+        return {
+            'statusCode': 200,
+            'body': json.dumps('Resume processed, analyzed, stored, and notified successfully.')
+        }
+
+    except Exception as e:
+        logger.error(f"Error processing Textract job {job_id} for {object_key}: {e}", exc_info=True)
+        sns_client.publish(
+            TopicArn=HR_SNS_TOPIC_ARN,
+            Subject=f"CRITICAL: Resume Analysis Failed for {object_key}",
+            Message=f"An error occurred during analysis: {e}. Please check CloudWatch logs for job ID {job_id}."
+        )
+        raise e
+
+
+
+
+
+6.2. IaC Updates for Advanced NLP (Conceptual CloudFormation/CDK)
+You'll need to update the ResumeAnalyzerLambdaRole to grant permissions to comprehend:DetectEntities and comprehend:DetectKeyPhrases.
+
+
+
+
+# -------------------------------------------------------------------
+# Part 6.2: IaC Updates for Advanced NLP - Conceptual CloudFormation/CDK
+# -------------------------------------------------------------------
+# Update ResumeAnalyzerLambdaRole
+  ResumeAnalyzerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ResumeAnalyzerPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - textract:GetDocumentAnalysis
+                  - textract:GetDocumentTextDetection
+                Resource: '*'
+              - Effect: Allow
+                Action: # ADD THESE COMPREHEND PERMISSIONS
+                  - comprehend:DetectEntities
+                  - comprehend:DetectKeyPhrases
+                  # For async Comprehend jobs (larger documents), you'd need:
+                  # - comprehend:StartKeyPhrasesDetectionJob
+                  # - comprehend:StartEntitiesDetectionJob
+                  # - s3:GetObject - if Comprehend reads from S3 for async jobs
+                  # - s3:PutObject - if Comprehend writes results to S3
+                Resource: '*' # Comprehend APIs are global
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt ProcessedResumesTable.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref HRAlertsTopic.Arn
+      Tags:
+        - Key: Project
+          Value: ResumeScreener
+
+
+
+
+
+6.3. Advanced NLP Considerations:
+Comprehend Custom Entity Recognition: For highly specific skills (e.g., "React.js," "TensorFlow"), standard Comprehend might not identify them as "skills." You can train a Custom Entity Recognizer in Comprehend by providing sample resumes and annotating skills. This offers far greater precision.
+Comprehend Async Jobs: For very large resumes (beyond 5000 bytes per API call), you would use comprehend_client.start_key_phrases_detection_job() and start_entities_detection_job(). These are asynchronous and publish results to S3, which would then trigger another Lambda (similar to how Textract triggers ResumeAnalyzerLambda).
+SageMaker Custom Models: If you need to build sophisticated models (e.g., to predict a candidate's fit score directly, classify resumes into job categories, or perform complex skill graph analysis), SageMaker provides the full ML lifecycle. You'd train your model there and deploy it as an endpoint. Your resume_analyzer_lambda would then invoke this SageMaker endpoint. This is a much larger undertaking.
+Lambda Layers for Python NLP Libraries: If you opt for Python libraries like spaCy or NLTK within your Lambda (for more control over parsing), you'll likely exceed the 50MB zipped deployment package limit. You'll need to package these libraries into a Lambda Layer and attach the layer to your ResumeAnalyzerLambda.
+By implementing these parts, you'll have a robust, user-friendly, and intelligent resume screening system on AWS!
+
+
+Sources
+
+
