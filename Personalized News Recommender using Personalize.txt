@@ -1,0 +1,532 @@
+the full Personalized News Recommender System codebase in chunks right here — starting with:
+
+✅ Lambda: Get Personalized Recommendations (Python)
+This Lambda fetches real-time news article recommendations for a user from an existing AWS Personalize Campaign.
+
+python
+Copy
+Edit
+# File: lambda/get_recommendations.py
+
+import os
+import boto3
+import json
+
+# Environment variable set during deployment
+PERSONALIZE_CAMPAIGN_ARN = os.environ['PERSONALIZE_CAMPAIGN_ARN']
+personalize_runtime = boto3.client('personalize-runtime')
+
+def lambda_handler(event, context):
+    user_id = event['queryStringParameters']['user_id']
+    try:
+        response = personalize_runtime.get_recommendations(
+            campaignArn=PERSONALIZE_CAMPAIGN_ARN,
+            userId=user_id,
+            numResults=10
+        )
+        item_list = [item['itemId'] for item in response['itemList']]
+        return {
+            'statusCode': 200,
+            'headers': {'Content-Type': 'application/json'},
+            'body': json.dumps({'recommended_items': item_list})
+        }
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }
+
+the entire codebase for the Personalized News Recommender System using AWS Personalize right here in chunks, following the order you requested:
+
+🧱 1. Terraform Infrastructure
+To set up:
+
+S3 bucket (for data and model artifacts)
+
+IAM roles
+
+Lambda function for real-time event ingestion
+
+API Gateway endpoint
+
+terraform/main.tf
+hcl
+Copy
+Edit
+provider "aws" {
+  region = var.region
+}
+
+resource "aws_s3_bucket" "news_data" {
+  bucket = "news-personalize-data-bucket"
+  force_destroy = true
+}
+
+resource "aws_iam_role" "lambda_exec" {
+  name = "personalize_lambda_exec_role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Action = "sts:AssumeRole",
+      Effect = "Allow",
+      Principal = {
+        Service = "lambda.amazonaws.com"
+      }
+    }]
+  })
+}
+
+resource "aws_iam_policy_attachment" "lambda_attach" {
+  name       = "attach_basic_execution"
+  roles      = [aws_iam_role.lambda_exec.name]
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+resource "aws_lambda_function" "realtime_event_ingest" {
+  filename         = "${path.module}/../lambda/realtime_ingest.zip"
+  function_name    = "RealTimeEventIngest"
+  role             = aws_iam_role.lambda_exec.arn
+  handler          = "realtime_ingest.lambda_handler"
+  runtime          = "python3.9"
+  source_code_hash = filebase64sha256("${path.module}/../lambda/realtime_ingest.zip")
+  environment {
+    variables = {
+      PERSONALIZE_TRACKER_ID = var.personalize_tracker_id
+    }
+  }
+}
+
+resource "aws_apigatewayv2_api" "personalize_api" {
+  name          = "PersonalizeAPI"
+  protocol_type = "HTTP"
+}
+
+resource "aws_apigatewayv2_integration" "lambda_integration" {
+  api_id           = aws_apigatewayv2_api.personalize_api.id
+  integration_type = "AWS_PROXY"
+  integration_uri  = aws_lambda_function.realtime_event_ingest.invoke_arn
+  integration_method = "POST"
+  payload_format_version = "2.0"
+}
+
+resource "aws_apigatewayv2_route" "route" {
+  api_id    = aws_apigatewayv2_api.personalize_api.id
+  route_key = "POST /interact"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda_integration.id}"
+}
+
+resource "aws_apigatewayv2_stage" "default" {
+  api_id      = aws_apigatewayv2_api.personalize_api.id
+  name        = "$default"
+  auto_deploy = true
+}
+
+resource "aws_lambda_permission" "apigw_invoke" {
+  statement_id  = "AllowAPIGatewayInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.realtime_event_ingest.arn
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.personalize_api.execution_arn}/*/*"
+}
+terraform/variables.tf
+hcl
+Copy
+Edit
+variable "region" {
+  default = "us-east-1"
+}
+
+variable "personalize_tracker_id" {
+  description = "Personalize Event Tracker ID"
+  type        = string
+}
+terraform/outputs.tf
+hcl
+Copy
+Edit
+output "api_endpoint" {
+  value = aws_apigatewayv2_api.personalize_api.api_endpoint
+}
+
+
+🧠 Lambda Function for Event Ingestion — the critical real-time glue between your user behavior and AWS Personalize.
+
+This Lambda receives user interaction events (e.g., news clicks, reads) and sends them to AWS Personalize Event Tracker in real-time to improve recommendations dynamically.
+
+📂 personalize-event-lambda/handler.py
+python
+Copy
+Edit
+import boto3
+import os
+import json
+import time
+
+personalize_events = boto3.client('personalize-events')
+
+EVENT_TRACKER_ID = os.environ['PERSONALIZE_TRACKER_ID']
+SESSION_TTL = 3600  # seconds
+
+def lambda_handler(event, context):
+    try:
+        print(f"Incoming event: {json.dumps(event)}")
+
+        user_id = event['user_id']
+        item_id = event['item_id']
+        event_type = event.get('event_type', 'click')
+        timestamp = int(time.time())
+
+        session_id = f"{user_id}-{int(timestamp / SESSION_TTL)}"
+
+        response = personalize_events.put_events(
+            trackingId=EVENT_TRACKER_ID,
+            userId=user_id,
+            sessionId=session_id,
+            eventList=[
+                {
+                    'eventType': event_type,
+                    'properties': json.dumps({'itemId': item_id}),
+                    'sentAt': timestamp
+                }
+            ]
+        )
+
+        print(f"Event submitted successfully: {response}")
+        return {
+            'statusCode': 200,
+            'body': json.dumps('Interaction event sent to Personalize.')
+        }
+
+    except Exception as e:
+        print(f"Error sending event to Personalize: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps('Failed to record interaction.')
+        }
+📁 personalize-event-lambda/.env (sample)
+env
+Copy
+Edit
+PERSONALIZE_TRACKER_ID=your-personalize-event-tracker-id
+🔐 IAM Permissions for Lambda
+Attach this IAM policy to the Lambda execution role:
+
+json
+Copy
+Edit
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "personalize:PutEvents",
+      "Resource": "arn:aws:personalize:YOUR_REGION:YOUR_ACCOUNT_ID:event-tracker/*"
+    }
+  ]
+}
+📦 Deployment ZIP (Structure)
+bash
+Copy
+Edit
+personalize-event-lambda/
+├── handler.py
+└── .env
+Deploy using:
+
+bash
+Copy
+Edit
+zip -r personalize-event-lambda.zip .
+Upload this to Lambda or use terraform + s3_object for automated deploys.
+
+🧬 3. Python Scripts for Dataset Import & Model Training with AWS Personalize
+These scripts handle:
+
+🧹 Uploading raw interaction, item, and user data into S3.
+
+🧠 Creating datasets and schema in Personalize.
+
+🔁 Training solutions and launching real-time campaigns.
+
+📁 personalize-training/
+📜 upload_datasets.py
+python
+Copy
+Edit
+import boto3
+import os
+
+s3 = boto3.client('s3')
+
+BUCKET = os.environ["S3_BUCKET"]
+PREFIX = "personalize-datasets"
+
+FILES = {
+    "interactions.csv": "interactions.csv",
+    "items.csv": "items.csv",
+    "users.csv": "users.csv"
+}
+
+for local_file, s3_key in FILES.items():
+    s3.upload_file(local_file, BUCKET, f"{PREFIX}/{s3_key}")
+    print(f"Uploaded {local_file} to s3://{BUCKET}/{PREFIX}/{s3_key}")
+📜 create_dataset_group_and_schemas.py
+python
+Copy
+Edit
+import boto3
+import time
+
+personalize = boto3.client('personalize')
+
+dataset_group_name = "news-recommendation-group"
+response = personalize.create_dataset_group(name=dataset_group_name)
+dataset_group_arn = response['datasetGroupArn']
+print("Dataset Group ARN:", dataset_group_arn)
+
+# Wait for ACTIVE
+while True:
+    status = personalize.describe_dataset_group(datasetGroupArn=dataset_group_arn)['datasetGroup']['status']
+    print("Dataset Group status:", status)
+    if status == 'ACTIVE':
+        break
+    time.sleep(10)
+
+schemas = {
+    "interactions": {
+        "name": "interactions-schema",
+        "schema": {
+            "type": "record",
+            "name": "Interactions",
+            "fields": [
+                {"name": "USER_ID", "type": "string"},
+                {"name": "ITEM_ID", "type": "string"},
+                {"name": "TIMESTAMP", "type": "long"},
+                {"name": "EVENT_TYPE", "type": "string"}
+            ],
+            "version": "1.0"
+        }
+    },
+    "items": {
+        "name": "items-schema",
+        "schema": {
+            "type": "record",
+            "name": "Items",
+            "fields": [
+                {"name": "ITEM_ID", "type": "string"},
+                {"name": "CATEGORY", "type": "string"},
+                {"name": "PUBLISH_DATE", "type": "long"},
+                {"name": "AUTHOR", "type": "string"}
+            ],
+            "version": "1.0"
+        }
+    },
+    "users": {
+        "name": "users-schema",
+        "schema": {
+            "type": "record",
+            "name": "Users",
+            "fields": [
+                {"name": "USER_ID", "type": "string"},
+                {"name": "AGE", "type": "int"},
+                {"name": "LOCATION", "type": "string"}
+            ],
+            "version": "1.0"
+        }
+    }
+}
+
+for key, val in schemas.items():
+    schema_resp = personalize.create_schema(
+        name=val["name"],
+        schema=str(val["schema"]).replace("'", '"')
+    )
+    print(f"Created schema {key}: {schema_resp['schemaArn']}")
+📜 import_datasets.py
+python
+Copy
+Edit
+import boto3
+import os
+
+personalize = boto3.client('personalize')
+
+BUCKET = os.environ["S3_BUCKET"]
+PREFIX = "personalize-datasets"
+dataset_group_arn = os.environ["DATASET_GROUP_ARN"]
+
+schemas = {
+    "interactions": os.environ["INTERACTIONS_SCHEMA_ARN"],
+    "items": os.environ["ITEMS_SCHEMA_ARN"],
+    "users": os.environ["USERS_SCHEMA_ARN"]
+}
+
+dataset_arns = {}
+
+for dataset_type, schema_arn in schemas.items():
+    response = personalize.create_dataset(
+        name=f"{dataset_type}-dataset",
+        datasetType=dataset_type,
+        datasetGroupArn=dataset_group_arn,
+        schemaArn=schema_arn
+    )
+    dataset_arn = response['datasetArn']
+    print(f"Dataset created: {dataset_arn}")
+    dataset_arns[dataset_type] = dataset_arn
+
+    personalize.create_dataset_import_job(
+        jobName=f"{dataset_type}-import-job",
+        datasetArn=dataset_arn,
+        dataSource={
+            "dataLocation": f"s3://{BUCKET}/{PREFIX}/{dataset_type}.csv"
+        },
+        roleArn=os.environ["PERSONALIZE_ROLE_ARN"]
+    )
+🧪 train_solution_and_campaign.py
+python
+Copy
+Edit
+import boto3
+import time
+import os
+
+personalize = boto3.client('personalize')
+
+dataset_group_arn = os.environ['DATASET_GROUP_ARN']
+
+# Step 1: Create solution
+solution_response = personalize.create_solution(
+    name='user-personalized-news',
+    datasetGroupArn=dataset_group_arn,
+    recipeArn='arn:aws:personalize:::recipe/aws-user-personalization'
+)
+
+solution_arn = solution_response['solutionArn']
+print("Training solution:", solution_arn)
+
+# Step 2: Wait and Create solution version
+status = "CREATE PENDING"
+while status not in ['ACTIVE', 'CREATE FAILED']:
+    version = personalize.create_solution_version(solutionArn=solution_arn)
+    version_arn = version['solutionVersionArn']
+    print("Waiting for solution version:", version_arn)
+    time.sleep(60)
+    status = personalize.describe_solution_version(solutionVersionArn=version_arn)['solutionVersion']['status']
+
+# Step 3: Create campaign
+campaign_response = personalize.create_campaign(
+    name="news-feed-campaign",
+    solutionVersionArn=version_arn,
+    minProvisionedTPS=1
+)
+
+print("Campaign ARN:", campaign_response['campaignArn'])
+
+
+🎨 4. Frontend or API Gateway Integration
+You’ve got a trained AWS Personalize campaign spitting out 🔥 recommendations. Now let’s build the API bridge + frontend glue that lets users actually see that magic.
+
+🧩 Option A: Lambda + API Gateway (backend as a service)
+📁 recommendation-api/lambda_handler.py
+python
+Copy
+Edit
+import boto3
+import os
+import json
+
+personalize_runtime = boto3.client("personalize-runtime")
+
+CAMPAIGN_ARN = os.environ["CAMPAIGN_ARN"]
+
+def lambda_handler(event, context):
+    try:
+        user_id = event['queryStringParameters']['user_id']
+        num_results = int(event['queryStringParameters'].get('num_results', 5))
+
+        response = personalize_runtime.get_recommendations(
+            campaignArn=CAMPAIGN_ARN,
+            userId=user_id,
+            numResults=num_results
+        )
+
+        return {
+            "statusCode": 200,
+            "body": json.dumps(response["itemList"])
+        }
+    except Exception as e:
+        print("Error:", str(e))
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": str(e)})
+        }
+🔐 API Gateway Setup via Terraform
+Add this to your api_gateway.tf if you're using infra-as-code:
+
+hcl
+Copy
+Edit
+resource "aws_api_gateway_rest_api" "recommendations" {
+  name = "news-recommendation-api"
+}
+
+resource "aws_api_gateway_resource" "recommend" {
+  rest_api_id = aws_api_gateway_rest_api.recommendations.id
+  parent_id   = aws_api_gateway_rest_api.recommendations.root_resource_id
+  path_part   = "recommend"
+}
+
+resource "aws_api_gateway_method" "get_method" {
+  rest_api_id   = aws_api_gateway_rest_api.recommendations.id
+  resource_id   = aws_api_gateway_resource.recommend.id
+  http_method   = "GET"
+  authorization = "NONE"
+}
+
+resource "aws_api_gateway_integration" "lambda_integration" {
+  rest_api_id             = aws_api_gateway_rest_api.recommendations.id
+  resource_id             = aws_api_gateway_resource.recommend.id
+  http_method             = aws_api_gateway_method.get_method.http_method
+  integration_http_method = "POST"
+  type                    = "AWS_PROXY"
+  uri                     = aws_lambda_function.recommendation_api.invoke_arn
+}
+
+resource "aws_lambda_permission" "allow_api_gateway" {
+  statement_id  = "AllowExecutionFromAPIGateway"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.recommendation_api.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_api_gateway_rest_api.recommendations.execution_arn}/*/*"
+}
+🖼 Option B: React/Vue/Frontend UI Fetch
+Here’s a sample frontend fetch to your deployed API:
+
+js
+Copy
+Edit
+// React or plain JS
+async function fetchRecommendations(userId) {
+  const res = await fetch(
+    `https://your-api-id.execute-api.region.amazonaws.com/prod/recommend?user_id=${userId}&num_results=5`
+  );
+  const data = await res.json();
+  return data;
+}
+Then map through and render the results:
+
+jsx
+Copy
+Edit
+{recommendations.map((item) => (
+  <ArticleCard key={item.itemId} id={item.itemId} score={item.score} />
+))}
+✅ CORS Note (for frontend):
+Make sure your API Gateway enables CORS responses:
+
+json
+Copy
+Edit
+"headers": {
+  "Access-Control-Allow-Origin": "*"
+}
