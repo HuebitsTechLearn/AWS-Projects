@@ -1,0 +1,709 @@
+ the full Secure File Upload System into chunks so you can build and run it piece by piece.
+
+Let’s start with Part 1: Terraform Setup for Cognito, API Gateway, Lambda, and S3.
+
+📁 Folder Structure (Preview)
+pgsql
+Copy
+Edit
+secure-file-upload/
+├── terraform/
+│   ├── main.tf
+│   ├── variables.tf
+│   └── outputs.tf
+├── lambda/
+│   └── generate_presigned_url/
+│       ├── handler.py
+│       └── requirements.txt
+├── frontend/
+│   └── index.html
+├── .env.example
+└── README.md
+🔧 Terraform: main.tf
+hcl
+Copy
+Edit
+provider "aws" {
+  region = var.aws_region
+}
+
+resource "aws_s3_bucket" "upload_bucket" {
+  bucket = var.s3_bucket_name
+  acl    = "private"
+
+  cors_rule {
+    allowed_headers = ["*"]
+    allowed_methods = ["PUT"]
+    allowed_origins = ["*"]
+    max_age_seconds = 3000
+  }
+}
+
+resource "aws_cognito_user_pool" "main" {
+  name = "upload_user_pool"
+}
+
+resource "aws_cognito_user_pool_client" "client" {
+  name         = "upload_user_client"
+  user_pool_id = aws_cognito_user_pool.main.id
+  generate_secret = false
+}
+
+resource "aws_iam_role" "lambda_exec" {
+  name = "lambda_execution_role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Action = "sts:AssumeRole",
+      Effect = "Allow",
+      Principal = {
+        Service = "lambda.amazonaws.com"
+      }
+    }]
+  })
+}
+
+resource "aws_iam_policy_attachment" "lambda_basic" {
+  name       = "lambda_basic"
+  roles      = [aws_iam_role.lambda_exec.name]
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+resource "aws_lambda_function" "generate_presigned_url" {
+  filename         = "${path.module}/../lambda/generate_presigned_url/function.zip"
+  function_name    = "generatePresignedUrl"
+  role             = aws_iam_role.lambda_exec.arn
+  handler          = "handler.lambda_handler"
+  runtime          = "python3.9"
+  source_code_hash = filebase64sha256("${path.module}/../lambda/generate_presigned_url/function.zip")
+  environment {
+    variables = {
+      BUCKET_NAME = aws_s3_bucket.upload_bucket.id
+    }
+  }
+}
+
+resource "aws_apigatewayv2_api" "upload_api" {
+  name          = "UploadAPI"
+  protocol_type = "HTTP"
+}
+
+resource "aws_apigatewayv2_integration" "lambda_integration" {
+  api_id             = aws_apigatewayv2_api.upload_api.id
+  integration_type   = "AWS_PROXY"
+  integration_uri    = aws_lambda_function.generate_presigned_url.invoke_arn
+  integration_method = "POST"
+  payload_format_version = "2.0"
+}
+
+resource "aws_apigatewayv2_route" "upload_route" {
+  api_id    = aws_apigatewayv2_api.upload_api.id
+  route_key = "POST /upload"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda_integration.id}"
+}
+
+resource "aws_apigatewayv2_stage" "default" {
+  api_id      = aws_apigatewayv2_api.upload_api.id
+  name        = "$default"
+  auto_deploy = true
+}
+
+resource "aws_lambda_permission" "api_invoke" {
+  statement_id  = "AllowExecutionFromAPIGateway"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.generate_presigned_url.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.upload_api.execution_arn}/*/*"
+}
+
+
+the full Secure File Upload System setup here in clean, digestible chunks. Here's the roadmap:
+
+🧱 Secure File Upload System – Architecture Summary
+Main Components:
+
+Cognito User Pool + Identity Pool for auth
+
+API Gateway + Lambda (Python) to generate pre-signed S3 PUT URLs
+
+S3 Bucket for file uploads
+
+Frontend (HTML + JS) to authenticate users and perform direct upload
+
+Terraform to provision everything
+
+README for usage + deployment instructions
+
+⛳ Let's start with Terraform setup — Part 1: Variables and Provider
+📁 terraform/variables.tf
+
+hcl
+Copy
+Edit
+variable "region" {
+  default = "us-east-1"
+}
+
+variable "bucket_name" {
+  default = "secure-file-upload-bucket"
+}
+
+variable "user_pool_name" {
+  default = "secure-upload-user-pool"
+}
+
+variable "identity_pool_name" {
+  default = "secure-upload-identity-pool"
+}
+
+variable "lambda_function_name" {
+  default = "GeneratePresignedUrlFunction"
+}
+📁 terraform/main.tf (start of the AWS resources)
+
+hcl
+Copy
+Edit
+provider "aws" {
+  region = var.region
+}
+
+resource "aws_s3_bucket" "uploads" {
+  bucket = var.bucket_name
+
+  cors_rule {
+    allowed_headers = ["*"]
+    allowed_methods = ["PUT"]
+    allowed_origins = ["*"]
+    max_age_seconds = 3000
+  }
+}
+
+resource "aws_cognito_user_pool" "user_pool" {
+  name = var.user_pool_name
+}
+
+resource "aws_cognito_user_pool_client" "user_pool_client" {
+  name         = "${var.user_pool_name}-client"
+  user_pool_id = aws_cognito_user_pool.user_pool.id
+  generate_secret = false
+}
+
+resource "aws_cognito_identity_pool" "identity_pool" {
+  identity_pool_name               = var.identity_pool_name
+  allow_unauthenticated_identities = false
+
+  cognito_identity_providers {
+    client_id         = aws_cognito_user_pool_client.user_pool_client.id
+    provider_name     = aws_cognito_user_pool.user_pool.endpoint
+    server_side_token_check = false
+  }
+}
+
+
+We’ll now build the full Secure File Upload System using:
+
+🔐 AWS Cognito (User authentication)
+
+☁️ API Gateway + Lambda (Generate pre-signed URLs)
+
+🗂️ Amazon S3 (File storage)
+
+⚙️ Terraform (Infrastructure provisioning)
+
+🌐 Frontend (HTML + JavaScript for direct upload)
+
+✅ Step 1: Project Structure
+We’ll structure your system as:
+
+css
+Copy
+Edit
+secure-upload/
+├── terraform/
+│   ├── main.tf
+│   ├── variables.tf
+│   ├── outputs.tf
+├── lambda/
+│   └── generate_presigned_url.py
+├── frontend/
+│   ├── index.html
+│   └── app.js
+├── .env.example
+└── README.md
+
+
+ou’ll get the Secure File Upload System components in the exact order:
+
+🧱 Terraform infrastructure
+
+🧠 Lambda logic
+
+🎨 Frontend upload client
+
+📄 .env + README setup
+
+Let’s begin with the first piece: Terraform provisioning.
+
+🧱 Terraform Infrastructure – infra/terraform/
+hcl
+Copy
+Edit
+# ─── provider.tf ─────────────────────
+provider "aws" {
+  region = var.aws_region
+}
+
+# ─── variables.tf ───────────────────
+variable "aws_region" {
+  default = "us-east-1"
+}
+
+variable "bucket_name" {
+  default = "secure-upload-bucket-example"
+}
+
+variable "user_pool_name" {
+  default = "secure-upload-user-pool"
+}
+
+variable "identity_pool_name" {
+  default = "secure-upload-identity-pool"
+}
+
+# ─── s3.tf ──────────────────────────
+resource "aws_s3_bucket" "upload_bucket" {
+  bucket = var.bucket_name
+}
+
+resource "aws_s3_bucket_public_access_block" "block_public" {
+  bucket = aws_s3_bucket.upload_bucket.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_cors_configuration" "cors" {
+  bucket = aws_s3_bucket.upload_bucket.id
+
+  cors_rule {
+    allowed_headers = ["*"]
+    allowed_methods = ["PUT"]
+    allowed_origins = ["*"]
+    expose_headers  = ["ETag"]
+    max_age_seconds = 3000
+  }
+}
+
+# ─── cognito.tf ─────────────────────
+resource "aws_cognito_user_pool" "user_pool" {
+  name = var.user_pool_name
+  auto_verified_attributes = ["email"]
+}
+
+resource "aws_cognito_user_pool_client" "user_pool_client" {
+  name         = "secure-upload-client"
+  user_pool_id = aws_cognito_user_pool.user_pool.id
+  explicit_auth_flows = ["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"]
+}
+
+resource "aws_cognito_identity_pool" "identity_pool" {
+  identity_pool_name               = var.identity_pool_name
+  allow_unauthenticated_identities = false
+
+  cognito_identity_providers {
+    client_id               = aws_cognito_user_pool_client.user_pool_client.id
+    provider_name           = aws_cognito_user_pool.user_pool.endpoint
+    server_side_token_check = false
+  }
+}
+
+resource "aws_iam_role" "authenticated_role" {
+  name = "CognitoAuthenticatedRole"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Action = "sts:AssumeRoleWithWebIdentity",
+      Effect = "Allow",
+      Principal = {
+        Federated = "cognito-identity.amazonaws.com"
+      },
+      Condition = {
+        StringEquals = {
+          "cognito-identity.amazonaws.com:aud" = aws_cognito_identity_pool.identity_pool.id
+        },
+        "ForAnyValue:StringLike" = {
+          "cognito-identity.amazonaws.com:amr" = "authenticated"
+        }
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "upload_policy" {
+  name = "CognitoUploadAccess"
+  role = aws_iam_role.authenticated_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Action = [
+        "s3:PutObject"
+      ],
+      Effect = "Allow",
+      Resource = "${aws_s3_bucket.upload_bucket.arn}/*"
+    }]
+  })
+}
+
+resource "aws_cognito_identity_pool_roles_attachment" "role_attach" {
+  identity_pool_id = aws_cognito_identity_pool.identity_pool.id
+
+  roles = {
+    authenticated = aws_iam_role.authenticated_role.arn
+  }
+}
+
+# ─── outputs.tf ─────────────────────
+output "bucket_name" {
+  value = aws_s3_bucket.upload_bucket.bucket
+}
+
+output "user_pool_id" {
+  value = aws_cognito_user_pool.user_pool.id
+}
+
+output "user_pool_client_id" {
+  value = aws_cognito_user_pool_client.user_pool_client.id
+}
+
+output "identity_pool_id" {
+  value = aws_cognito_identity_pool.identity_pool.id
+}
+
+
+ 🧠 Lambda Logic – lambda/generate_presigned_url.py + IAM permissions
+
+🧠 lambda/generate_presigned_url.py
+python
+Copy
+Edit
+import json
+import os
+import boto3
+import urllib.parse
+from datetime import datetime
+
+s3 = boto3.client('s3')
+BUCKET_NAME = os.environ['UPLOAD_BUCKET']
+
+def lambda_handler(event, context):
+    try:
+        # Cognito identity ID from the request context
+        user_id = event['requestContext']['authorizer']['claims']['sub']
+        body = json.loads(event['body'])
+
+        filename = body.get("filename")
+        content_type = body.get("contentType", "application/octet-stream")
+
+        if not filename:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "Missing filename"})
+            }
+
+        timestamp = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+        key = f"uploads/{user_id}/{timestamp}_{urllib.parse.quote(filename)}"
+
+        presigned_url = s3.generate_presigned_url(
+            'put_object',
+            Params={
+                'Bucket': BUCKET_NAME,
+                'Key': key,
+                'ContentType': content_type
+            },
+            ExpiresIn=300,
+            HttpMethod='PUT'
+        )
+
+        return {
+            "statusCode": 200,
+            "headers": { "Access-Control-Allow-Origin": "*" },
+            "body": json.dumps({
+                "uploadUrl": presigned_url,
+                "key": key
+            })
+        }
+
+    except Exception as e:
+        print("Error generating pre-signed URL:", e)
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": str(e)})
+        }
+🛡 Lambda IAM Policy – Minimum Required Permissions
+Attach this inline policy to the Lambda’s execution role:
+
+json
+Copy
+Edit
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::your-bucket-name/uploads/*"
+    }
+  ]
+}
+Replace your-bucket-name with the actual bucket provisioned from Terraform.
+
+🔧 Lambda Environment Variable
+Set UPLOAD_BUCKET as an environment variable in the Lambda configuration pointing to your S3 bucket name.
+
+
+🎨 Frontend Upload Client – Secure File Upload via S3 Pre-Signed URL + Cognito Auth
+Here’s a lightweight HTML + JavaScript setup that authenticates the user via AWS Cognito, requests a pre-signed URL from your API Gateway endpoint, and performs a direct upload to S3.
+
+📁 frontend/index.html
+html
+Copy
+Edit
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Secure File Upload</title>
+</head>
+<body>
+  <h2>Upload File to S3</h2>
+  <input type="file" id="fileInput" />
+  <button onclick="uploadFile()">Upload</button>
+  <p id="status"></p>
+
+  <script src="https://cdn.jsdelivr.net/npm/amazon-cognito-identity-js@6.1.0/dist/amazon-cognito-identity.min.js"></script>
+  <script src="https://sdk.amazonaws.com/js/aws-sdk-2.1397.0.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
+📁 frontend/app.js
+javascript
+Copy
+Edit
+// 👇 ENV CONFIG (replace these with your actual values)
+const poolData = {
+  UserPoolId: 'us-east-1_XXXXXXX',
+  ClientId: 'YYYYYYYYYYYYYYYYYYYY'
+};
+const apiEndpoint = 'https://your-api-id.execute-api.us-east-1.amazonaws.com/prod/presign';
+
+const userPool = new AmazonCognitoIdentity.CognitoUserPool(poolData);
+const fileInput = document.getElementById('fileInput');
+const status = document.getElementById('status');
+
+// Replace with your actual Cognito credentials (for demo only – use real sign-in flow in prod)
+const username = 'testuser@example.com';
+const password = 'YourTestPassword123!';
+
+const authenticationDetails = new AmazonCognitoIdentity.AuthenticationDetails({
+  Username: username,
+  Password: password
+});
+
+const userData = {
+  Username: username,
+  Pool: userPool
+};
+
+const cognitoUser = new AmazonCognitoIdentity.CognitoUser(userData);
+
+function uploadFile() {
+  status.innerText = "Authenticating...";
+
+  cognitoUser.authenticateUser(authenticationDetails, {
+    onSuccess: function (result) {
+      const idToken = result.getIdToken().getJwtToken();
+
+      const file = fileInput.files[0];
+      if (!file) {
+        status.innerText = "No file selected.";
+        return;
+      }
+
+      status.innerText = "Requesting upload URL...";
+      fetch(apiEndpoint, {
+        method: 'POST',
+        headers: {
+          'Authorization': idToken,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          filename: file.name,
+          contentType: file.type
+        })
+      })
+        .then(res => res.json())
+        .then(data => {
+          if (!data.uploadUrl) throw new Error("Invalid pre-signed response");
+          status.innerText = "Uploading to S3...";
+
+          return fetch(data.uploadUrl, {
+            method: 'PUT',
+            headers: {
+              'Content-Type': file.type
+            },
+            body: file
+          });
+        })
+        .then(() => {
+          status.innerText = "Upload complete ✅";
+        })
+        .catch(err => {
+          console.error(err);
+          status.innerText = "Upload failed ❌";
+        });
+
+    },
+    onFailure: function (err) {
+      console.error(err);
+      status.innerText = "Authentication failed ❌";
+    }
+  });
+}
+🔐 CORS Configuration for S3 Bucket
+json
+Copy
+Edit
+[
+  {
+    "AllowedHeaders": ["*"],
+    "AllowedMethods": ["PUT"],
+    "AllowedOrigins": ["*"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3000
+  }
+]
+For production, set AllowedOrigins to your frontend's actual origin (e.g., https://yourdomain.com)
+
+
+📄 Final Setup: .env + README.md for Secure File Upload System (S3 + Cognito + Lambda + API Gateway)
+Here’s everything you need to tie the system together, explain usage, and enable plug-and-play deployment.
+
+📄 .env (for your Lambda function)
+env
+Copy
+Edit
+UPLOAD_BUCKET=your-bucket-name
+UPLOAD_URL_EXPIRY=900
+🔒 Do not commit this file to version control. Store secrets securely using AWS Parameter Store or Secrets Manager in production.
+
+📄 README.md
+markdown
+Copy
+Edit
+# 🔐 Secure File Upload System (S3 + Cognito + Lambda + Pre-Signed URLs)
+
+This project enables secure, authenticated file uploads directly to Amazon S3 using AWS Cognito for identity, API Gateway for request control, and Lambda to generate pre-signed URLs.
+
+---
+
+## 📁 Folder Structure
+
+secure-upload-system/
+├── terraform/ # Infrastructure provisioning
+├── lambda/ # Lambda function to generate pre-signed URL
+├── frontend/ # HTML + JS frontend client
+├── .env # Environment config for Lambda
+└── README.md # You're reading it
+
+yaml
+Copy
+Edit
+
+---
+
+## 🚀 Tech Stack
+
+- AWS Cognito (User Pools + Identity Pools)
+- AWS API Gateway
+- AWS Lambda (Node.js/Python)
+- Amazon S3 (CORS-enabled bucket)
+- IAM (fine-grained roles & permissions)
+- HTML + JavaScript client (vanilla or framework-ready)
+
+---
+
+## 🔧 Setup Instructions
+
+### 1. Infrastructure Deployment
+
+```bash
+cd terraform/
+terraform init
+terraform apply
+✅ This will provision:
+
+Cognito User Pool + Identity Pool
+
+S3 Upload Bucket
+
+Lambda Function with IAM Role
+
+API Gateway endpoint
+
+Required IAM Roles & Policies
+
+2. Environment Configuration
+Update .env with:
+
+env
+Copy
+Edit
+UPLOAD_BUCKET=your-bucket-name
+UPLOAD_URL_EXPIRY=900
+Deploy Lambda function using AWS CLI or console and attach environment variables.
+
+3. Frontend Setup
+Navigate to /frontend/
+
+Edit app.js and replace:
+
+UserPoolId
+
+ClientId
+
+API Gateway endpoint
+
+Open index.html in your browser
+
+Authenticate (hardcoded credentials for demo)
+
+Upload a file!
+
+✅ Security Benefits
+Temporary, scoped access via pre-signed URLs
+
+Serverless infrastructure with no credential leakage
+
+All file transfer bypasses Lambda/API Gateway
+
+IAM roles enforce upload path restrictions (e.g. user-id/filename)
+
+🔐 Notes for Production
+Enable MFA in Cognito
+
+Add file type & size validation in Lambda
+
+Store .env securely using AWS Systems Manager Parameter Store
+
+Replace hardcoded frontend auth with real login flow
+
+Secure CORS policies for your domain only
+
